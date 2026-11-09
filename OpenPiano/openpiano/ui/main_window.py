@@ -54,6 +54,7 @@ from openpiano.core.keymap import current_layout_demo_rows, qwerty_demo_rows
 from openpiano.core.audio_levels import normalize_volume
 from openpiano.core.object_tree import is_descendant_of
 from openpiano.core.preset_families import FamilyPreset, default_family_catalog, default_preset_family
+from openpiano.core.split import MAX_SPLIT_ZONES
 from openpiano.core.theme import ThemePalette
 from openpiano.ui.combo_options import (
     bank_options, family_options, family_preset_options, instrument_options, midi_input_options,
@@ -73,6 +74,8 @@ from openpiano.ui.panel_sections import (
     create_section_card,
 )
 from openpiano.ui.piano_widget import PianoWidget
+from openpiano.ui.plugin_folders_dialog import PluginFoldersDialog
+from openpiano.ui.split_panel import PluginCardControls, create_split_card
 from openpiano.ui.spotlight_overlay import SpotlightOverlay
 from openpiano.ui.stats_bar import StatsBar
 from openpiano.ui.styled_controls import ChevronComboBox, RoundHandleSliderStyle, SquareCheckBoxStyle
@@ -151,6 +154,10 @@ class MainWindow(QMainWindow):
     pianoDownloadCanceled = Signal()
     resetKeyColorsRequested = Signal()
     updateProgressCanceled = Signal()
+    splitZoneChanged = Signal(int, object)
+    pluginRescanRequested = Signal()
+    pluginFoldersRequested = Signal()
+    pluginEditorRequested = Signal(int)
 
     def __init__(self, theme: ThemePalette, icon_path: Path | None = None) -> None:
         super().__init__()
@@ -441,6 +448,22 @@ class MainWindow(QMainWindow):
         keybind_hint_row.addWidget(self.keybind_hint_label, 1)
         keyboard_layout.addLayout(keybind_hint_row)
 
+        self.split_card, split_layout = self._create_section_card("Keyboard Split", self.settings_body)
+        layout.addWidget(self.split_card)
+        self.split_zone_controls, self.split_hint_label = create_split_card(
+            self.split_card, split_layout, self._sp, MAX_SPLIT_ZONES,
+        )
+        for zone_controls in self.split_zone_controls:
+            zone_controls.changed.connect(self.splitZoneChanged.emit)
+            zone_controls.editorRequested.connect(self.pluginEditorRequested.emit)
+
+        self.plugin_card, plugin_layout = self._create_section_card("Plug-ins (VST3)", self.settings_body)
+        layout.addWidget(self.plugin_card)
+        self.plugin_controls = PluginCardControls(self.plugin_card, plugin_layout)
+        self.plugin_controls.rescanRequested.connect(self.pluginRescanRequested.emit)
+        self.plugin_controls.foldersRequested.connect(self.pluginFoldersRequested.emit)
+        self.plugin_controls.editorRequested.connect(lambda: self.pluginEditorRequested.emit(-1))
+
         self.interface_card, interface_layout = self._create_section_card("Interface", self.settings_body)
         layout.addWidget(self.interface_card)
 
@@ -728,6 +751,8 @@ class MainWindow(QMainWindow):
         for card, use_controls_row in (
             (self.sound_card, False),
             (self.keyboard_card, False),
+            (self.split_card, False),
+            (self.plugin_card, False),
             (self.interface_card, False),
             (self.settings_updates_card, False),
             (self.controls_card, True),
@@ -740,7 +765,7 @@ class MainWindow(QMainWindow):
                 card_layout.setSpacing(self._sp(4))
             else:
                 card_layout.setContentsMargins(self._sp(8), self._sp(7), self._sp(8), self._sp(7))
-                if card is self.keyboard_card:
+                if card is self.keyboard_card or card is self.split_card:
                     card_layout.setSpacing(self._sp(4))
                 else:
                     card_layout.setSpacing(self._sp(8))
@@ -753,6 +778,9 @@ class MainWindow(QMainWindow):
                     self._configure_controls_row(row)
                 else:
                     self._configure_settings_row(row)
+
+        for zone_controls in self.split_zone_controls:
+            zone_controls.refresh_metrics()
 
         if hasattr(self, "controls_grid"):
             self.controls_grid.setContentsMargins(self._sp(4), self._sp(1), self._sp(4), self._sp(1))
@@ -811,6 +839,7 @@ class MainWindow(QMainWindow):
             self.sustain_slider,
             self.sustain_fade_slider,
             self.ui_scale_slider,
+            *(zone_controls.volume_slider for zone_controls in self.split_zone_controls),
         )
 
     def _install_slider_styles(self) -> None:
@@ -1429,7 +1458,7 @@ class MainWindow(QMainWindow):
                 color: {accent_foreground};
                 background: {self.theme.accent};
             }}
-            #instrumentCombo, #bankCombo, #familyCombo, #presetCombo, #animCombo, #midiInputCombo {{
+            #instrumentCombo, #bankCombo, #familyCombo, #presetCombo, #animCombo, #midiInputCombo, #splitCombo {{
                 background: {self.theme.app_bg};
                 color: {self.theme.text_primary};
                 border: 1px solid {self.theme.border};
@@ -1444,7 +1473,8 @@ class MainWindow(QMainWindow):
             #familyCombo::drop-down,
             #presetCombo::drop-down,
             #animCombo::drop-down,
-            #midiInputCombo::drop-down {{
+            #midiInputCombo::drop-down,
+            #splitCombo::drop-down {{
                 subcontrol-origin: padding;
                 subcontrol-position: top right;
                 width: {self._sp(30)}px;
@@ -1459,7 +1489,8 @@ class MainWindow(QMainWindow):
             #familyCombo::down-arrow,
             #presetCombo::down-arrow,
             #animCombo::down-arrow,
-            #midiInputCombo::down-arrow {{
+            #midiInputCombo::down-arrow,
+            #splitCombo::down-arrow {{
                 image: none;
                 width: 0px;
                 height: 0px;
@@ -1473,7 +1504,8 @@ class MainWindow(QMainWindow):
             #familyCombo QAbstractItemView,
             #presetCombo QAbstractItemView,
             #animCombo QAbstractItemView,
-            #midiInputCombo QAbstractItemView {{
+            #midiInputCombo QAbstractItemView,
+            #splitCombo QAbstractItemView {{
                 background: {self.theme.panel_bg};
                 color: {self.theme.text_primary};
                 border: 1px solid {self.theme.border};
@@ -1486,7 +1518,8 @@ class MainWindow(QMainWindow):
             #transposeSlider,
             #sustainSlider,
             #sustainFadeSlider,
-            #uiScaleSlider {{
+            #uiScaleSlider,
+            #splitVolumeSlider {{
                 min-height: {slider_min_h}px;
                 background: transparent;
             }}
@@ -1579,6 +1612,9 @@ class MainWindow(QMainWindow):
         if style_sheet != self._last_stylesheet:
             self._last_stylesheet = style_sheet
             self.setStyleSheet(style_sheet)
+            # Their widths follow the font, which the style sheet has just changed.
+            for zone_controls in self.split_zone_controls:
+                zone_controls.refresh_metrics()
         self._refresh_key_color_buttons()
         self._refresh_slider_style_colors()
         self._refresh_checkbox_style_colors()
@@ -2607,6 +2643,47 @@ class MainWindow(QMainWindow):
             selected=str(selected_id or ""),
             default_index=0,
         )
+
+    def set_split_instruments(self, instruments: list[InstrumentInfo]) -> None:
+        options = instrument_options(instruments)
+        for zone_controls in self.split_zone_controls:
+            zone_controls.set_instrument_options(list(options))
+
+    def set_split_zones(self, zones) -> None:
+        for zone_controls, zone in zip(self.split_zone_controls, zones):
+            zone_controls.set_zone(zone)
+        self.piano_widget.set_split_zones(zones)
+
+    def set_split_zone_state(self, index: int, state) -> None:
+        if not 0 <= int(index) < len(self.split_zone_controls):
+            return
+        self.split_zone_controls[int(index)].set_state(
+            status=state.status,
+            error=state.error,
+            programs=state.programs,
+            program_names=state.program_names,
+            bank=state.bank,
+            preset=state.preset,
+            is_plugin=state.is_plugin,
+        )
+
+    def set_plugin_status(self, text: str, details: str = "", *, available: bool = True, scanning: bool = False) -> None:
+        self.plugin_controls.set_status(text, details, available=available, scanning=scanning)
+
+    def set_plugin_editor_available(self, available: bool) -> None:
+        self.plugin_controls.set_editor_available(available)
+
+    def ask_plugin_folders(self, default_folders: list[str], folders: list[str]) -> list[str] | None:
+        dialog = PluginFoldersDialog(self, self.theme, default_folders, folders)
+        with self._transient_dialog(dialog):
+            window_icon = self.windowIcon()
+            if not window_icon.isNull():
+                dialog.setWindowIcon(window_icon)
+            apply_dialog_button_cursors_util(dialog)
+            self._apply_windows_title_bar_theme(dialog)
+            if dialog.exec() != QDialog.Accepted:
+                return None
+            return dialog.folders()
 
     def set_bank_preset_options(
         self,

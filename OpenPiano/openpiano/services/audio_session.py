@@ -44,9 +44,12 @@ class AudioSession(QObject):
     failed = Signal(object)
     closed = Signal()
 
-    def __init__(self, factory: Callable, current, parent=None) -> None:
+    def __init__(self, factory: Callable, current, parent=None, *, factory_for: Callable | None = None) -> None:
         super().__init__(parent)
         self._factory = factory
+        # Lets one session host different kinds of engine: given a request, it returns the
+        # factory to use for it, or None for the default one.
+        self._factory_for = factory_for
         self._current = current
         self._condition = threading.Condition()
         self._serial = 0
@@ -141,10 +144,13 @@ class AudioSession(QObject):
             self.close()
 
     def _prepare(self, request, cancel):
-        candidate = self._factory()
+        factory = self._factory
+        if self._factory_for is not None:
+            factory = self._factory_for(request) or factory
+        candidate = factory()
         try:
             candidate.set_master_volume(request.volume)
-            if isinstance(candidate, FluidSynthAudioEngine):
+            if isinstance(candidate, FluidSynthAudioEngine) or getattr(candidate, 'accepts_stop_event', False):
                 candidate.set_instrument(request.path, bank=request.bank, preset=request.preset, stop_event=cancel)
             else:
                 candidate.set_instrument(request.path, bank=request.bank, preset=request.preset)

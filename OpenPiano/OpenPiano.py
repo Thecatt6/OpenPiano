@@ -23,6 +23,13 @@ import signal
 import sys
 from pathlib import Path
 
+if "--openpiano-probe-plugins" in sys.argv[1:]:
+    # Helper mode: OpenPiano starts itself this way to look inside plug-in files, so that a
+    # plug-in which crashes while being scanned cannot take the piano down with it.
+    from openpiano.core.plugin_probe import main as _probe_plugins
+
+    raise SystemExit(_probe_plugins([arg for arg in sys.argv[1:] if arg != "--openpiano-probe-plugins"]))
+
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 

@@ -49,6 +49,8 @@ Choose a 61 or 88 key layout, personalize the controls and appearance, explore d
 - 61 and 88 key piano layouts with clear visual feedback.
 - Computer keyboard, mouse, and MIDI controller input in the same session.
 - Included Default and Grand Piano sounds, an optional Steinway D-274 download, and compatible SF2/SF3 instrument files.
+- VST3 instrument plug-ins installed on the computer are found automatically and can be played like any other sound.
+- Keyboard split: up to three key ranges that each play their own sound, next to the main one.
 - Custom key mappings with save, discard, and undo.
 - Adjustable volume, note strength, sustain, pitch, animation speed, and interface size.
 - Themes and individual piano key colors.
@@ -82,17 +84,35 @@ OpenPiano includes Default and Grand Piano SoundFonts, listed as **OpenPiano Bui
 
 Use **Controls** to select the instrument, bank and preset. Adjust volume, note strength, sustain and pitch in **Settings > Sound**.
 
+### Play VST3 instrument plug-ins
+
+OpenPiano looks for VST3 instrument plug-ins each time it starts and adds the ones it finds to the instrument list in **Controls**, marked **VST3 Plug-in**. It searches the standard Windows locations (`C:\Program Files\Common Files\VST3` and `%LOCALAPPDATA%\Programs\Common\VST3`) and `%LOCALAPPDATA%\OpenPiano\plugins`. Add more locations with **Settings > Plug-ins (VST3) > Plug-in Folders…**, and use **Rescan Plug-ins** after installing a new plug-in while OpenPiano is open.
+
+Select a plug-in like any other instrument. Its sounds are chosen in the plug-in's own window, opened with **Open Plug-in Window**, so the bank and preset lists stay empty. OpenPiano remembers what you set there for the next session.
+
+Each plug-in is checked in a separate helper process, so a plug-in that crashes or hangs while being checked is left out of the list instead of closing OpenPiano. If OpenPiano closes unexpectedly while it is loading a plug-in, it starts with a built-in sound the next time and tells you which plug-in was skipped.
+
+Only VST3 instruments are supported. Effect plug-ins and the VST2, CLAP and AU formats are not listed.
+
+### Split the keyboard
+
+Use **Settings > Keyboard Split** to give a range of keys its own sound, for example a bass in the left hand and a piano in the right. Tick **Zone 1**, **Zone 2** or **Zone 3**, choose the lowest and highest key, then pick the sound for that range: any SoundFont with its preset, or a VST3 plug-in. Each zone has its own volume, relative to the main volume, and an octave shift. Keys outside every zone keep playing the main instrument.
+
+A coloured strip above the keys shows where each zone lies. Zones do not layer: where two overlap, the lower-numbered zone plays. A zone applies to the note that sounds, the one that lights up on the piano, so transposing can move a key into or out of a zone.
+
 The included SoundFonts use calibrated preset levels to reduce volume jumps while preserving touch response. 100% is the standard level; the range up to 200% provides additional gain and can engage overload protection during louder playing. WAV export uses the same preset levels.
 
 ### Keep the performance
 
 Save a take as MIDI when you want to edit its notes, timing, velocity and recorded sustain-pedal events in music software. MIDI does not include the instrument sound. Choose WAV for a stereo audio file rendered with the SoundFont, bank, preset and volume selected when you export. WAV is rendered from the take; it is not a recording of every live sound-setting change.
 
+WAV export renders SoundFonts only. It is not available while a VST3 plug-in is the main instrument, and with a keyboard split it plays the whole take with the main instrument. MIDI export is unaffected.
+
 ### Installer, standalone and local files
 
 Both Windows versions include the components and piano sounds needed to start playing. No separate Python installation or sound download is required.
 
-Settings and user SoundFonts normally stay under `%LOCALAPPDATA%\OpenPiano`, including with standalone. Moving the executable does not move those files. Save recordings to the location you choose. Playing and recording work locally; updates, optional downloads, and links you open can use the internet.
+Settings, user SoundFonts, and the plug-in list and plug-in settings normally stay under `%LOCALAPPDATA%\OpenPiano`, including with standalone. Moving the executable does not move those files. Save recordings to the location you choose. Playing and recording work locally; updates, optional downloads, and links you open can use the internet.
 
 ## Project resources
 
@@ -109,6 +129,7 @@ Settings and user SoundFonts normally stay under `%LOCALAPPDATA%\OpenPiano`, inc
 - Windows (primary runtime target).
 - Python 3.11 or later.
 - Dependencies in [`OpenPiano/requirements.txt`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/requirements.txt).
+- VST3 hosting uses [`pedalboard`](https://github.com/spotify/pedalboard) (GPL-3.0), which brings `numpy` with it. OpenPiano also runs without it; the plug-in features are then switched off.
 
 ### Running From Source
 
@@ -125,6 +146,12 @@ py OpenPiano.py
 - Theme palette definitions: [`OpenPiano/openpiano/core/theme.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/theme.py)
 - Tutorial step content: [`OpenPiano/openpiano/services/tutorial_flow.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/services/tutorial_flow.py)
 - Application entry point: [`OpenPiano/OpenPiano.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/OpenPiano.py)
+- Keyboard split rules: [`OpenPiano/openpiano/core/split.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/split.py)
+- VST3 discovery and hosting: [`OpenPiano/openpiano/core/plugin_registry.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/plugin_registry.py), [`OpenPiano/openpiano/core/plugin_host.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/plugin_host.py)
+
+### Packaging Notes
+
+Plug-ins are checked in a helper process. From source this is `python -m openpiano.core.plugin_probe`; a frozen build starts its own executable again with `--openpiano-probe-plugins`, which `OpenPiano.py` handles before any window is created. A packaged build therefore has to include `pedalboard` and keep that argument check at the top of the entry point.
 
 </details>
 

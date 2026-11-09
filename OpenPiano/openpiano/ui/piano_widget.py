@@ -18,6 +18,7 @@ from openpiano.core.config import (
     normalize_piano_style,
 )
 from openpiano.core.keymap import binding_to_label, is_black_key
+from openpiano.core.split import SPLIT_ZONE_COLORS, zone_index_for_note
 from openpiano.core.theme import ThemePalette, apply_key_color_overrides
 
 if TYPE_CHECKING:
@@ -123,6 +124,7 @@ class PianoWidget(QWidget):
         self._effect_sparks: list[_EffectSpark] = []
         self._last_effect_tick = 0.0
         self._anim_timer_id = 0
+        self._split_zones: tuple = ()
         self.setMouseTracking(True)
 
     def _ensure_animation_timer(self) -> None:
@@ -224,6 +226,51 @@ class PianoWidget(QWidget):
         self._rebuild_geometry()
         self.updateGeometry()
         self.update()
+
+    def set_split_zones(self, zones) -> None:
+        zones = tuple(zones or ())
+        if zones == self._split_zones:
+            return
+        self._split_zones = zones
+        self.update()
+
+    def split_marker_runs(self) -> list[tuple[int, int, int]]:
+        """Runs of neighbouring keys that share a split zone, as (zone index, first note, last note)."""
+        runs: list[tuple[int, int, int]] = []
+        if not any(zone.enabled for zone in self._split_zones):
+            return runs
+        for note in self._notes:
+            index = zone_index_for_note(self._split_zones, note)
+            if index is None:
+                continue
+            if runs and runs[-1][0] == index and runs[-1][2] == note - 1:
+                runs[-1] = (index, runs[-1][1], note)
+            else:
+                runs.append((index, note, note))
+        return runs
+
+    def _paint_split_markers(self, painter: QPainter, clip_f: QRectF) -> None:
+        runs = self.split_marker_runs()
+        if not runs:
+            return
+        height = float(max(2, self._sp(3)))
+        top = float(self._top_margin()) - height - 1.0
+        if top < 0.0:
+            top = 0.0
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        for index, first, last in runs:
+            first_rect = self._rect_by_note.get(first)
+            last_rect = self._rect_by_note.get(last)
+            if first_rect is None or last_rect is None:
+                continue
+            bar = QRectF(first_rect.left() + 1.0, top, last_rect.right() - first_rect.left() - 2.0, height)
+            if bar.width() <= 0.0 or not bar.intersects(clip_f):
+                continue
+            painter.setBrush(QColor(SPLIT_ZONE_COLORS[index % len(SPLIT_ZONE_COLORS)]))
+            painter.drawRoundedRect(bar, height / 2.0, height / 2.0)
+        painter.restore()
 
     def set_keybind_edit_mode(self, active: bool, selected_note: int | None = None) -> None:
         self._keybind_edit_mode = bool(active)
@@ -551,6 +598,7 @@ class PianoWidget(QWidget):
             self._paint_premium(painter, clip_f)
         else:
             self._paint_classic(painter, clip_f)
+        self._paint_split_markers(painter, clip_f)
         painter.end()
 
     def _effect_color(self) -> QColor:
