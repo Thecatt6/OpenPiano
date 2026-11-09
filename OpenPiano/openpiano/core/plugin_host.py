@@ -14,6 +14,7 @@ from openpiano.core.audio_levels import normalize_volume
 from openpiano.core.audio_output import default_output_driver, list_output_drivers
 from openpiano.core.audio_engine import AUDIO_SAMPLE_RATE
 from openpiano.core.normalize import clamp_int
+from openpiano.core.plugin_probe import plugin_binary_path
 from openpiano.core.plugin_registry import PluginInfo
 
 PLUGIN_BLOCK_SIZE = 2048
@@ -151,7 +152,8 @@ def _load_pedalboard_plugin(info: PluginInfo):
         raise FileNotFoundError(f"Plug-in not found: {info.path}")
     # No warm-up: it would block the interface while it plays a test note, and the app's own
     # event loop already gives the plug-in the idle time the warm-up exists to provide.
-    return pedalboard.VST3Plugin(info.path, plugin_name=info.name or None, initialization_timeout=0.0)
+    return pedalboard.VST3Plugin(plugin_binary_path(info.path), plugin_name=info.name or None,
+                                 initialization_timeout=0.0)
 
 
 def _default_output(render, sample_rate: int):

@@ -19,7 +19,8 @@ from openpiano.core.runtime_paths import app_local_data_dir, project_root
 PLUGIN_SOURCE = "plugin"
 PLUGIN_ID_PREFIX = "plugin:"
 PLUGIN_EXTENSIONS = (".vst3",)
-PLUGIN_CACHE_VERSION = 1
+# Raised whenever results an older version cached could be wrong, so that they are redone.
+PLUGIN_CACHE_VERSION = 2
 PLUGIN_CACHE_FILE_NAME = "plugin_cache.json"
 PLUGIN_PROBE_FLAG = "--openpiano-probe-plugins"
 PLUGIN_SCAN_DEPTH = 4
@@ -59,6 +60,9 @@ class PluginFileResult:
     signature: tuple[int, int]
     plugins: tuple[PluginInfo, ...] = ()
     error: str = ""
+    # True when the failure says nothing about the plug-in itself (the scanner could not
+    # run). Such a result is shown but not remembered, so the next scan tries again.
+    retry: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +344,22 @@ def _read_probe_events(output_path: Path) -> list[dict[str, object]]:
     return events
 
 
+def _probe_failure_reason(exit_code: int | None, stderr_path: Path) -> str:
+    """What is known about a helper that ended without reporting: its exit code and the last
+    line it wrote to its error stream."""
+    parts = []
+    if exit_code is not None:
+        parts.append(f"exit code {exit_code}")
+    try:
+        lines = stderr_path.read_bytes()[-4000:].decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    last = next((line.strip() for line in reversed(lines) if line.strip()), "")
+    if last:
+        parts.append(last[:240].rstrip("."))
+    return f" ({': '.join(parts)})" if parts else ""
+
+
 def run_probe_process(paths: Sequence[str], *, stop_event: threading.Event | None = None,
                       on_progress: Callable[[str], None] | None = None,
                       stall_seconds: float = PLUGIN_PROBE_STALL_SECONDS,
@@ -360,14 +380,18 @@ def run_probe_process(paths: Sequence[str], *, stop_event: threading.Event | Non
             options: dict[str, object] = {}
             if sys.platform == "win32":
                 options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            # Kept so that a helper which dies before it can report anything leaves a reason.
+            stderr_path = Path(work) / f"stderr-{attempt}.txt"
             try:
-                process = subprocess.Popen(
-                    [*base_command, "--input", str(input_path), "--output", str(output_path)],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    env=_probe_environment(), **options)
+                with open(stderr_path, "wb") as stderr_file:
+                    process = subprocess.Popen(
+                        [*base_command, "--input", str(input_path), "--output", str(output_path)],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr_file,
+                        env=_probe_environment(), **options)
             except OSError as error:
                 for path in remaining:
-                    results[path] = {"plugins": [], "error": f"Could not start the plug-in scanner: {error}"}
+                    results[path] = {"plugins": [], "retry": True,
+                                     "error": f"Could not start the plug-in scanner: {error}"}
                 break
             seen_events = 0
             last_progress = time.monotonic()
@@ -396,7 +420,11 @@ def run_probe_process(paths: Sequence[str], *, stop_event: threading.Event | Non
             except subprocess.TimeoutExpired:
                 pass
             started: str | None = None
+            fatal = ""
             for event in _read_probe_events(output_path):
+                if event.get("event") == "fatal":
+                    fatal = str(event.get("error") or "unknown error")
+                    continue
                 path = event.get("path")
                 if not isinstance(path, str):
                     continue
@@ -413,15 +441,22 @@ def run_probe_process(paths: Sequence[str], *, stop_event: threading.Event | Non
                         started = None
             if stop_event is not None and stop_event.is_set():
                 break
+            if fatal:
+                for path in remaining:
+                    results.setdefault(path, {"plugins": [], "retry": True,
+                                              "error": f"The plug-in host could not start: {fatal}"})
+                break
             if started is not None and started not in results:
                 reason = ("did not respond while it was being scanned" if stalled
                           else "crashed while it was being scanned")
                 results[started] = {"plugins": [], "error": f"The plug-in {reason}."}
             unfinished = [path for path in remaining if path not in results]
             if len(unfinished) == len(remaining):
-                # The helper made no progress at all (for example pedalboard failed to import).
+                # The helper made no progress at all, so this is not about any one plug-in.
+                reason = _probe_failure_reason(process.poll(), stderr_path)
                 for path in unfinished:
-                    results[path] = {"plugins": [], "error": "The plug-in scanner stopped unexpectedly."}
+                    results[path] = {"plugins": [], "retry": True,
+                                     "error": f"The plug-in scanner stopped unexpectedly{reason}."}
                 break
             remaining = unfinished
     return results
@@ -469,9 +504,10 @@ def scan_plugins(cache_path: Path, extra_dirs: Iterable[str | Path] = (), *, for
                 plugin for plugin in (_plugin_from_payload(path, item) for item in raw.get("plugins") or ())
                 if plugin is not None
             )
-            files[path] = PluginFileResult(path, signatures[path], plugins, str(raw.get("error") or ""))
+            files[path] = PluginFileResult(path, signatures[path], plugins, str(raw.get("error") or ""),
+                                           retry=raw.get("retry") is True)
 
     ordered = tuple(files[path] for path in paths if path in files)
     if not (stop_event is not None and stop_event.is_set()):
-        save_plugin_cache(cache_path, ordered)
+        save_plugin_cache(cache_path, (item for item in ordered if not item.retry))
     return PluginScanResult(files=ordered, folders=tuple(str(folder) for folder in folders))

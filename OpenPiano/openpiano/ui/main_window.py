@@ -74,8 +74,8 @@ from openpiano.ui.panel_sections import (
     create_section_card,
 )
 from openpiano.ui.piano_widget import PianoWidget
-from openpiano.ui.plugin_folders_dialog import PluginFoldersDialog
-from openpiano.ui.split_panel import PluginCardControls, create_split_card
+from openpiano.ui.plugin_folders_dialog import PluginDetailsDialog, PluginFoldersDialog
+from openpiano.ui.split_panel import PluginCardControls, create_split_card, other_zone_ranges
 from openpiano.ui.spotlight_overlay import SpotlightOverlay
 from openpiano.ui.stats_bar import StatsBar
 from openpiano.ui.styled_controls import ChevronComboBox, RoundHandleSliderStyle, SquareCheckBoxStyle
@@ -451,7 +451,7 @@ class MainWindow(QMainWindow):
         self.split_card, split_layout = self._create_section_card("Keyboard Split", self.settings_body)
         layout.addWidget(self.split_card)
         self.split_zone_controls, self.split_hint_label = create_split_card(
-            self.split_card, split_layout, self._sp, MAX_SPLIT_ZONES,
+            self.split_card, split_layout, self._sp, MAX_SPLIT_ZONES, lambda: self.theme,
         )
         for zone_controls in self.split_zone_controls:
             zone_controls.changed.connect(self.splitZoneChanged.emit)
@@ -463,6 +463,7 @@ class MainWindow(QMainWindow):
         self.plugin_controls.rescanRequested.connect(self.pluginRescanRequested.emit)
         self.plugin_controls.foldersRequested.connect(self.pluginFoldersRequested.emit)
         self.plugin_controls.editorRequested.connect(lambda: self.pluginEditorRequested.emit(-1))
+        self.plugin_controls.detailsRequested.connect(self.show_plugin_details)
 
         self.interface_card, interface_layout = self._create_section_card("Interface", self.settings_body)
         layout.addWidget(self.interface_card)
@@ -1522,6 +1523,31 @@ class MainWindow(QMainWindow):
             #splitVolumeSlider {{
                 min-height: {slider_min_h}px;
                 background: transparent;
+            }}
+            #splitRangeButton {{
+                background: {self.theme.app_bg};
+                color: {self.theme.text_primary};
+                border: 1px solid {self.theme.border};
+                border-radius: 6px;
+                padding: {self._sp(2)}px {self._sp(8)}px;
+                font: 600 {label_font}pt "Segoe UI";
+                min-height: {combo_height}px;
+                text-align: left;
+            }}
+            #splitRangeButton:hover {{
+                border-color: {self.theme.accent};
+            }}
+            #splitRangePopup {{
+                background: {self.theme.panel_bg};
+                border: 1px solid {self.theme.border};
+            }}
+            #splitRangeTitle {{
+                color: {self.theme.text_primary};
+                font: 700 {label_font}pt "Segoe UI";
+            }}
+            #splitRangeValue {{
+                color: {self.theme.text_primary};
+                font: 600 {label_font}pt "Segoe UI";
             }}
             #colorButton, #actionButton, #resetButton {{
                 background: {self.theme.panel_bg};
@@ -2650,9 +2676,17 @@ class MainWindow(QMainWindow):
             zone_controls.set_instrument_options(list(options))
 
     def set_split_zones(self, zones) -> None:
-        for zone_controls, zone in zip(self.split_zone_controls, zones):
-            zone_controls.set_zone(zone)
+        zones = list(zones)
+        for index, (zone_controls, zone) in enumerate(zip(self.split_zone_controls, zones)):
+            zone_controls.set_zone(zone, other_zone_ranges(zones, index))
         self.piano_widget.set_split_zones(zones)
+
+    def feed_split_range_note(self, note: int) -> bool:
+        """Passes a played key to the key-range picker when one is open."""
+        for zone_controls in self.split_zone_controls:
+            if zone_controls.feed_note(note):
+                return True
+        return False
 
     def set_split_zone_state(self, index: int, state) -> None:
         if not 0 <= int(index) < len(self.split_zone_controls):
@@ -2672,6 +2706,16 @@ class MainWindow(QMainWindow):
 
     def set_plugin_editor_available(self, available: bool) -> None:
         self.plugin_controls.set_editor_available(available)
+
+    def show_plugin_details(self) -> None:
+        dialog = PluginDetailsDialog(self, self.theme, self.plugin_controls.report_text())
+        with self._transient_dialog(dialog):
+            window_icon = self.windowIcon()
+            if not window_icon.isNull():
+                dialog.setWindowIcon(window_icon)
+            apply_dialog_button_cursors_util(dialog)
+            self._apply_windows_title_bar_theme(dialog)
+            dialog.exec()
 
     def ask_plugin_folders(self, default_folders: list[str], folders: list[str]) -> list[str] | None:
         dialog = PluginFoldersDialog(self, self.theme, default_folders, folders)

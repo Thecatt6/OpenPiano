@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import platform
+import sys
 import threading
+from importlib import metadata
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -133,8 +136,16 @@ class PluginLibrary(QObject):
         return text + "."
 
     def details_text(self) -> str:
+        """Everything a person needs to see why a plug-in is, or is not, in the list."""
         lines = ["Folders searched:"]
         lines.extend(f"  {folder}" for folder in (self._result.folders or self.default_folders + self._folders))
+        instruments = self._result.instruments
+        if instruments:
+            lines.append("")
+            lines.append("Instruments:")
+            lines.extend(f"  {plugin.display_name}  ({Path(plugin.path).name})" for plugin in instruments[:60])
+            if len(instruments) > 60:
+                lines.append(f"  … and {len(instruments) - 60} more")
         effects = [plugin for plugin in self._result.plugins if not plugin.is_instrument]
         if effects:
             lines.append("")
@@ -144,10 +155,25 @@ class PluginLibrary(QObject):
         if failures:
             lines.append("")
             lines.append("Could not be loaded:")
-            lines.extend(f"  {Path(item.path).name}: {item.error}" for item in failures[:12])
-            if len(failures) > 12:
-                lines.append(f"  … and {len(failures) - 12} more")
+            for item in failures[:40]:
+                lines.append(f"  {Path(item.path).name}: {item.error}")
+                lines.append(f"      {item.path}")
+            if len(failures) > 40:
+                lines.append(f"  … and {len(failures) - 40} more")
+        lines.append("")
+        lines.append(self.host_text())
         return "\n".join(lines)
+
+    def host_text(self) -> str:
+        if not self.available:
+            return PLUGIN_SUPPORT_HINT
+        try:
+            host = f"pedalboard {metadata.version('pedalboard')}"
+        except Exception:
+            host = "pedalboard"
+        bits = "64-bit" if sys.maxsize > 2 ** 32 else "32-bit"
+        return (f"Plug-in host: {host}, Python {platform.python_version()} ({bits}), "
+                f"{platform.system()} {platform.machine()}")
 
     def rescan(self, force: bool = False) -> bool:
         if not self.available or self._closed:

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -104,3 +106,49 @@ class PluginFoldersDialog(QDialog):
         for item in self.folder_list.selectedItems():
             self.folder_list.takeItem(self.folder_list.row(item))
         self._refresh_buttons()
+
+
+class PluginDetailsDialog(QDialog):
+    """Read-only report of the last plug-in scan, with the text ready to copy."""
+
+    def __init__(self, parent: QWidget | None, theme: ThemePalette, report: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Plug-in Details")
+        self.setModal(True)
+        self.setMinimumSize(620, 380)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        self.report_view = QPlainTextEdit(self)
+        self.report_view.setObjectName("pluginReport")
+        self.report_view.setReadOnly(True)
+        self.report_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.report_view.setPlainText(str(report or ""))
+        layout.addWidget(self.report_view, 1)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Close, self)
+        self.copy_button = self.button_box.addButton("Copy", QDialogButtonBox.ActionRole)
+        self.copy_button.clicked.connect(self._copy)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        self.setStyleSheet(message_box_stylesheet(theme) + f"""
+            #pluginReport {{
+                background: {theme.app_bg};
+                color: {theme.text_primary};
+                border: 1px solid {theme.border};
+                border-radius: 6px;
+                selection-background-color: {theme.accent};
+                selection-color: #FFFFFF;
+            }}
+        """)
+
+        # Room for the longer label the button shows once the text has been copied.
+        self.copy_button.ensurePolished()
+        self.copy_button.setText("Copied")
+        self.copy_button.setMinimumWidth(self.copy_button.sizeHint().width())
+        self.copy_button.setText("Copy")
+
+    def _copy(self) -> None:
+        QGuiApplication.clipboard().setText(self.report_view.toPlainText())
+        self.copy_button.setText("Copied")

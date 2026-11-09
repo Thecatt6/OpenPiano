@@ -92,11 +92,13 @@ Select a plug-in like any other instrument. Its sounds are chosen in the plug-in
 
 Each plug-in is checked in a separate helper process, so a plug-in that crashes or hangs while being checked is left out of the list instead of closing OpenPiano. If OpenPiano closes unexpectedly while it is loading a plug-in, it starts with a built-in sound the next time and tells you which plug-in was skipped.
 
+When the status line says that some plug-ins could not be loaded, **Details…** lists the folders that were searched, the instruments that were found, and the reason for each plug-in that was left out. **Copy** puts that text on the clipboard, which is the useful thing to include when reporting a plug-in that does not show up.
+
 Only VST3 instruments are supported. Effect plug-ins and the VST2, CLAP and AU formats are not listed.
 
 ### Split the keyboard
 
-Use **Settings > Keyboard Split** to give a range of keys its own sound, for example a bass in the left hand and a piano in the right. Tick **Zone 1**, **Zone 2** or **Zone 3**, choose the lowest and highest key, then pick the sound for that range: any SoundFont with its preset, or a VST3 plug-in. Each zone has its own volume, relative to the main volume, and an octave shift. Keys outside every zone keep playing the main instrument.
+Use **Settings > Keyboard Split** to give a range of keys its own sound, for example a bass in the left hand and a piano in the right. Tick **Zone 1**, **Zone 2** or **Zone 3**, click the zone's key range to open a picture of the keyboard, and drag across the keys the zone should cover. A single click moves the nearer end of the range, and with a MIDI keyboard connected you can simply play the lowest and the highest key. The arrow keys move the top of the range, Shift with the arrow keys moves the bottom, and Esc or Enter closes the picture. Then pick the sound for that range: any SoundFont with its preset, or a VST3 plug-in. Each zone has its own volume, relative to the main volume, and an octave shift. Keys outside every zone keep playing the main instrument.
 
 A coloured strip above the keys shows where each zone lies. Zones do not layer: where two overlap, the lower-numbered zone plays. A zone applies to the note that sounds, the one that lights up on the piano, so transposing can move a key into or out of a zone.
 
@@ -150,6 +152,8 @@ py OpenPiano.py
 - VST3 discovery and hosting: [`OpenPiano/openpiano/core/plugin_registry.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/plugin_registry.py), [`OpenPiano/openpiano/core/plugin_host.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/plugin_host.py)
 
 ### Packaging Notes
+
+A VST3 plug-in is either a single `.vst3` file or a bundle folder (`Name.vst3\Contents\x86_64-win\Name.vst3`). On Windows `pedalboard` only accepts the file, so `plugin_binary_path` in `plugin_probe.py` resolves a bundle to the binary for the running architecture before the plug-in is scanned or loaded; the bundle folder stays the plug-in's identity in settings.
 
 Plug-ins are checked in a helper process. From source this is `python -m openpiano.core.plugin_probe`; a frozen build starts its own executable again with `--openpiano-probe-plugins`, which `OpenPiano.py` handles before any window is created. A packaged build therefore has to include `pedalboard` and keep that argument check at the top of the entry point.
 

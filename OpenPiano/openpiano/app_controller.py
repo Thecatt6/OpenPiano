@@ -2100,6 +2100,9 @@ class PianoAppController(QObject):
             return True
         if int(event.key()) in {int(Qt.Key.Key_Tab), int(Qt.Key.Key_Backtab)}:
             return False
+        if QApplication.activePopupWidget() is not None:
+            # An open drop-down or key-range picker handles its own keys.
+            return False
         focus = QApplication.focusWidget()
         return focus is None or focus is self.window or focus is self.window.piano_widget
 
@@ -2549,6 +2552,8 @@ class PianoAppController(QObject):
 
     def _activate_note(self, note: int, source: str, velocity: int = 100, *,
                        timestamp: float | None = None) -> None:
+        # While a zone's key-range picker is open, a played key also sets an end of the range.
+        self.window.feed_split_range_note(int(note))
         if getattr(self, '_audio_handoff', False):
             return
         if note not in self._note_sources:

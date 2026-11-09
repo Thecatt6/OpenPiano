@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Sequence
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
@@ -25,12 +25,14 @@ from openpiano.core.split import (
     SPLIT_OCTAVE_MIN,
     SPLIT_ZONE_COLORS,
     SplitZone,
-    note_name,
 )
+from openpiano.core.theme import ThemePalette
 from openpiano.ui.combo_options import zone_program_options
+from openpiano.ui.key_range_picker import KeyRangeButton, KeyRangePopup, OtherRange
 from openpiano.ui.styled_controls import ChevronComboBox
 
 ScaleFunc = Callable[[int], int]
+ThemeProvider = Callable[[], ThemePalette]
 
 
 def _set_combo_data(combo: ChevronComboBox, value: object) -> None:
@@ -64,14 +66,23 @@ class SplitZoneControls(QObject):
     changed = Signal(int, object)
     editorRequested = Signal(int)
 
-    def __init__(self, index: int, card: QWidget, card_layout: QVBoxLayout, scale: ScaleFunc) -> None:
+    def __init__(self, index: int, card: QWidget, card_layout: QVBoxLayout, scale: ScaleFunc,
+                 theme: ThemeProvider) -> None:
         super().__init__(card)
         self.index = index
+        self._card = card
         self._scale = scale
+        self._theme = theme
         self._enabled = False
         self._ready = False
         self._instrument_id = ""
+        self._low = SPLIT_NOTE_MIN
+        self._high = SPLIT_NOTE_MAX
+        self._others: list[OtherRange] = []
+        self._range_popup: KeyRangePopup | None = None
+        self._range_popup_scale = 0
         color = SPLIT_ZONE_COLORS[index % len(SPLIT_ZONE_COLORS)]
+        self._color = color
 
         range_row = QHBoxLayout()
         self.swatch = QFrame(card)
@@ -81,17 +92,10 @@ class SplitZoneControls(QObject):
         self.enable_checkbox = QCheckBox(f"Zone {index + 1}", card)
         self.enable_checkbox.setObjectName("settingCheckbox")
         self.enable_checkbox.toggled.connect(lambda checked: self._emit(enabled=bool(checked)))
-        self.low_combo = ChevronComboBox(card)
-        self.high_combo = ChevronComboBox(card)
-        for combo, key, description in ((self.low_combo, "low", "Lowest key"), (self.high_combo, "high", "Highest key")):
-            combo.setObjectName("splitCombo")
-            combo.setAccessibleName(f"Zone {index + 1} {description.lower()}")
-            combo.setToolTip(f"{description} of zone {index + 1}.")
-            for note in range(SPLIT_NOTE_MIN, SPLIT_NOTE_MAX + 1):
-                combo.addItem(note_name(note), userData=note)
-            combo.currentIndexChanged.connect(lambda _index, c=combo, k=key: self._emit_combo(c, k))
-        self.range_separator = QLabel("to", card)
-        self.range_separator.setObjectName("settingHint")
+        self.range_button = KeyRangeButton(scale, card)
+        self.range_button.setAccessibleName(f"Zone {index + 1} key range")
+        self.range_button.setToolTip(f"Choose the keys of zone {index + 1} on a picture of the keyboard.")
+        self.range_button.clicked.connect(self.open_range_picker)
         self.octave_combo = ChevronComboBox(card)
         self.octave_combo.setObjectName("splitCombo")
         self.octave_combo.setAccessibleName(f"Zone {index + 1} octave shift")
@@ -105,9 +109,7 @@ class SplitZoneControls(QObject):
         self.status_label.setMinimumWidth(0)
         range_row.addWidget(self.swatch)
         range_row.addWidget(self.enable_checkbox)
-        range_row.addWidget(self.low_combo)
-        range_row.addWidget(self.range_separator)
-        range_row.addWidget(self.high_combo)
+        range_row.addWidget(self.range_button)
         range_row.addWidget(self.octave_combo)
         range_row.addWidget(self.status_label, 1)
         card_layout.addLayout(range_row)
@@ -144,7 +146,7 @@ class SplitZoneControls(QObject):
         sound_row.addWidget(self.editor_button)
         self._sound_row = sound_row
         card_layout.addLayout(sound_row)
-        for combo in (self.low_combo, self.high_combo, self.octave_combo, self.instrument_combo, self.program_combo):
+        for combo in (self.octave_combo, self.instrument_combo, self.program_combo):
             combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.instrument_combo.setMinimumContentsLength(12)
         self.program_combo.setMinimumContentsLength(8)
@@ -156,8 +158,7 @@ class SplitZoneControls(QObject):
     def refresh_metrics(self) -> None:
         swatch = max(8, self._scale(10))
         self.swatch.setFixedSize(swatch, swatch)
-        for combo in (self.low_combo, self.high_combo):
-            combo.setMinimumWidth(self._combo_width(combo, "C#8"))
+        self._refresh_range_button()
         self.octave_combo.setMinimumWidth(self._combo_width(self.octave_combo, "Octave +3"))
         self.volume_slider.setMinimumWidth(self._scale(90))
 
@@ -169,6 +170,40 @@ class SplitZoneControls(QObject):
         field = combo.style().subControlRect(QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxEditField, combo)
         chrome = option.rect.width() - field.width() if field.isValid() else self._scale(70)
         return combo.fontMetrics().horizontalAdvance(widest_text) + max(0, chrome) + self._scale(8)
+
+    def _refresh_range_button(self) -> None:
+        self.range_button.show_range(self._low, self._high, self._color, self._theme())
+
+    def open_range_picker(self) -> None:
+        popup = self._range_popup
+        built_for = self._scale(1000)
+        if popup is not None and built_for != self._range_popup_scale:
+            # Its sizes belong to the interface scale it was made at.
+            popup.deleteLater()
+            popup = None
+        if popup is None:
+            # A child of the card, so that it takes the window's fonts and colours.
+            popup = KeyRangePopup(self._scale, self._card)
+            popup.rangeChanged.connect(lambda low, high: self._emit(low=int(low), high=int(high)))
+            self._range_popup = popup
+            self._range_popup_scale = built_for
+        popup.configure(
+            title=f"Zone {self.index + 1} keys",
+            low=self._low,
+            high=self._high,
+            color=self._color,
+            others=self._others,
+            theme=self._theme(),
+        )
+        popup.open_below(self.range_button)
+
+    def range_picker(self) -> KeyRangePopup | None:
+        popup = self._range_popup
+        return popup if popup is not None and popup.isVisible() else None
+
+    def feed_note(self, note: int) -> bool:
+        popup = self._range_popup
+        return popup is not None and popup.feed_note(note)
 
     def _emit(self, **changes: object) -> None:
         self.changed.emit(self.index, changes)
@@ -193,20 +228,26 @@ class SplitZoneControls(QObject):
         self._emit(volume=int(value) / 100.0)
 
     def _refresh_enabled(self) -> None:
-        for widget in (self.low_combo, self.high_combo, self.octave_combo, self.volume_slider):
+        for widget in (self.octave_combo, self.volume_slider):
             widget.setEnabled(self._enabled)
         self.instrument_combo.setEnabled(self.instrument_combo.count() > 0)
         self.program_combo.setEnabled(self._enabled and self._ready and self.program_combo.count() > 0)
         self.editor_button.setEnabled(self._enabled and self._ready)
 
-    def set_zone(self, zone: SplitZone) -> None:
+    def set_zone(self, zone: SplitZone, others: Sequence[OtherRange] = ()) -> None:
         self._enabled = bool(zone.enabled)
         self._instrument_id = zone.instrument_id
+        self._low = int(zone.low)
+        self._high = int(zone.high)
+        self._others = list(others)
         blocked = self.enable_checkbox.blockSignals(True)
         self.enable_checkbox.setChecked(self._enabled)
         self.enable_checkbox.blockSignals(blocked)
-        _set_combo_data(self.low_combo, int(zone.low))
-        _set_combo_data(self.high_combo, int(zone.high))
+        self._refresh_range_button()
+        popup = self.range_picker()
+        if popup is not None:
+            popup.set_range(self._low, self._high)
+            popup.set_other_ranges(self._others)
         _set_combo_data(self.octave_combo, int(zone.octave))
         _set_combo_data(self.instrument_combo, zone.instrument_id)
         blocked = self.volume_slider.blockSignals(True)
@@ -237,14 +278,24 @@ class SplitZoneControls(QObject):
         self._refresh_enabled()
 
 
+def other_zone_ranges(zones: Sequence[SplitZone], index: int) -> list[OtherRange]:
+    """The ranges of the other zones that are switched on, with their marker colours."""
+    return [
+        (int(zone.low), int(zone.high), SPLIT_ZONE_COLORS[position % len(SPLIT_ZONE_COLORS)])
+        for position, zone in enumerate(zones)
+        if position != index and zone.enabled
+    ]
+
+
 def create_split_card(
-    card: QFrame, card_layout: QVBoxLayout, scale: ScaleFunc, zone_count: int,
+    card: QFrame, card_layout: QVBoxLayout, scale: ScaleFunc, zone_count: int, theme: ThemeProvider,
 ) -> tuple[list[SplitZoneControls], QLabel]:
-    zones = [SplitZoneControls(index, card, card_layout, scale) for index in range(zone_count)]
+    zones = [SplitZoneControls(index, card, card_layout, scale, theme) for index in range(zone_count)]
     hint_row = QHBoxLayout()
     hint = QLabel(
         "Each zone plays its own sound over a range of keys; every other key keeps the main "
-        "instrument. Where zones overlap, the lowest-numbered zone plays.",
+        "instrument. Click a zone's keys to choose its range on the keyboard. Where zones "
+        "overlap, the lowest-numbered zone plays.",
         card,
     )
     hint.setObjectName("settingHint")
@@ -259,6 +310,7 @@ class PluginCardControls(QObject):
     rescanRequested = Signal()
     foldersRequested = Signal()
     editorRequested = Signal()
+    detailsRequested = Signal()
 
     def __init__(self, card: QWidget, card_layout: QVBoxLayout) -> None:
         super().__init__(card)
@@ -283,17 +335,29 @@ class PluginCardControls(QObject):
         self.editor_button.setToolTip("Open the window of the plug-in selected as the main instrument.")
         self.editor_button.clicked.connect(self.editorRequested.emit)
         self.editor_button.setEnabled(False)
+        self.details_button = QPushButton("Details…", card)
+        self.details_button.setObjectName("actionButton")
+        self.details_button.setToolTip("Show which plug-ins were found and why any could not be loaded.")
+        self.details_button.clicked.connect(self.detailsRequested.emit)
         button_row.addWidget(self.rescan_button)
         button_row.addWidget(self.folders_button)
+        button_row.addWidget(self.details_button)
         button_row.addWidget(self.editor_button)
         button_row.addStretch(1)
         card_layout.addLayout(button_row)
+        self._details = ""
 
     def set_status(self, text: str, details: str, *, available: bool, scanning: bool) -> None:
         self.status_label.setText(text)
-        self.status_label.setToolTip(details)
+        self._details = str(details or "")
+        # The full report can run to many lines; it opens with the Details button instead.
+        self.status_label.setToolTip("Details… lists what was found and why a plug-in was left out."
+                                     if self._details else "")
         self.rescan_button.setEnabled(available and not scanning)
         self.folders_button.setEnabled(available)
+
+    def report_text(self) -> str:
+        return "\n\n".join(part for part in (self.status_label.text(), self._details) if part)
 
     def set_editor_available(self, available: bool) -> None:
         self.editor_button.setEnabled(bool(available))
