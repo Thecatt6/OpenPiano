@@ -167,6 +167,8 @@ A VST3 plug-in is either a single `.vst3` file or a bundle folder (`Name.vst3\Co
 
 Plug-ins are checked in a helper process. From source this is `python -m openpiano.core.plugin_probe`; a frozen build starts its own executable again with `--openpiano-probe-plugins`, which `OpenPiano.py` handles before any window is created. A packaged build therefore has to include `pedalboard` and keep that argument check at the top of the entry point.
 
+`pedalboard` opens a plug-in's window without choosing a place for it, which on Windows leaves the title bar above the top edge of the screen. [`plugin_window.py`](OpenPiano/openpiano/core/plugin_window.py) finds that window once it is shown, centres it on the screen OpenPiano is on and titles it with the plug-in's name.
+
 </details>
 
 ## Security and OS Warnings

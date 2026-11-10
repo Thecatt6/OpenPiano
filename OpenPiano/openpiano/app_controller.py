@@ -68,6 +68,7 @@ from openpiano.core.midi_recording import MidiRecorder
 from openpiano.core.piano_pedal import PedalState
 from openpiano.core.plugin_host import PluginAudioEngine
 from openpiano.core.plugin_registry import is_plugin_instrument_id
+from openpiano.core.plugin_window import PluginWindowPlacer
 from openpiano.core.object_tree import is_descendant_of
 from openpiano.core.program_selection import normalize_available_programs, normalize_program_selection
 from openpiano.core.runtime_paths import icon_path_candidates
@@ -1324,11 +1325,35 @@ class PianoAppController(QObject):
         # The plug-in window runs its own loop until it is closed. On Windows that loop also
         # serves this application; elsewhere it has to be kept alive from here.
         keep_alive = None if sys.platform == 'win32' else QApplication.processEvents
+        # The host opens the window with its title bar above the top of the screen and under
+        # its own name; this brings it next to OpenPiano and names it after the plug-in.
+        placer = PluginWindowPlacer(self._plugin_window_title(engine, index), self._main_window_handle())
+
+        def on_poll() -> None:
+            placer.poll()
+            if keep_alive is not None:
+                keep_alive()
+
         try:
-            opener(keep_alive)
+            opener(on_poll)
         except Exception as exc:
             if not self._is_shutdown:
                 self.window.show_warning("Plug-in", f"The plug-in window could not be opened.\n\n{exc}")
+
+    def _plugin_window_title(self, engine, index: int) -> str:
+        name = str(getattr(engine, 'plugin_name', '') or '').strip() or "Plug-in"
+        if index >= 0:
+            return f"{name} – Zone {index + 1} – {APP_NAME}"
+        return f"{name} – {APP_NAME}"
+
+    def _main_window_handle(self) -> int:
+        """The native handle of the main window, which tells the plug-in window's screen."""
+        if sys.platform != 'win32':
+            return 0
+        try:
+            return int(self.window.winId())
+        except Exception:
+            return 0
 
     def _on_mode_changed(self, mode: str) -> None:
         new_mode: PianoMode = "88" if mode == "88" else "61"
