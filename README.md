@@ -141,6 +141,16 @@ py -m pip install -r requirements.txt
 py OpenPiano.py
 ```
 
+### Building the Windows Program
+
+```powershell
+cd OpenPiano
+py -m pip install -r requirements.txt pyinstaller
+py build_exe.py
+```
+
+[`build_exe.py`](OpenPiano/build_exe.py) runs PyInstaller and writes `dist\OpenPiano.exe`, a single file that runs without Python installed. It packs the FluidSynth libraries, the VST3 host and the SoundFonts found in `OpenPiano\soundfonts`; add `--soundfonts FOLDER` to pack the SoundFonts of another folder as well. `--folder` makes a folder that starts faster instead of one file, and `--console` keeps a console open to read error messages. VST3 plug-ins are not packed; they stay where they are installed.
+
 ### Configuration Files
 
 - App constants and release endpoints: [`OpenPiano/openpiano/core/config.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/config.py)
