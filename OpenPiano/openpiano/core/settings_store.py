@@ -32,6 +32,12 @@ from openpiano.core.config import (
 from openpiano.core.keymap import MIDI_END_88, MIDI_START_88, PianoMode, binding_from_id, binding_to_id
 from openpiano.core.normalize import clamp_float, clamp_int
 from openpiano.core.audio_levels import normalize_volume
+from openpiano.core.sound_presets import (
+    SoundPreset,
+    default_sound_presets,
+    normalize_sound_presets,
+    sound_presets_payload,
+)
 from openpiano.core.split import SplitZone, default_split_zones, normalize_split_zones, split_zones_payload
 
 SETTINGS_FILE_NAME = "OpenPiano_config.json"
@@ -78,6 +84,7 @@ class AppSettings:
     split_zones: tuple[SplitZone, ...] = field(default_factory=default_split_zones)
     plugin_folders: tuple[str, ...] = ()
     split_open: bool = False
+    sound_presets: tuple[SoundPreset, ...] = field(default_factory=default_sound_presets)
 
 
 def _appdata_settings_dir() -> Path | None:
@@ -293,6 +300,7 @@ def load_settings(path: Path | None = None) -> AppSettings:
     split_zones = normalize_split_zones(payload.get("split_zones"))
     plugin_folders = _clamp_plugin_folders(payload.get("plugin_folders"))
     split_open = _clamp_bool(payload.get("split_open"), False)
+    sound_presets = normalize_sound_presets(payload.get("sound_presets"))
     return AppSettings(
         mode=mode,
         instrument_id=instrument_id,
@@ -326,6 +334,7 @@ def load_settings(path: Path | None = None) -> AppSettings:
         split_zones=split_zones,
         plugin_folders=plugin_folders,
         split_open=split_open,
+        sound_presets=sound_presets,
     )
 
 
@@ -368,6 +377,7 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
         "split_zones": split_zones_payload(settings.split_zones),
         "plugin_folders": list(_clamp_plugin_folders(settings.plugin_folders)),
         "split_open": _clamp_bool(settings.split_open, False),
+        "sound_presets": sound_presets_payload(settings.sound_presets),
     }
     raw = json.dumps(payload, indent=2)
 

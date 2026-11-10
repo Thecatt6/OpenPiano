@@ -76,6 +76,7 @@ from openpiano.ui.panel_sections import (
 )
 from openpiano.ui.piano_widget import PianoWidget
 from openpiano.ui.plugin_folders_dialog import PluginDetailsDialog, PluginFoldersDialog
+from openpiano.ui.sound_presets_dialog import SoundPresetRow, SoundPresetsDialog
 from openpiano.ui.split_panel import (
     ElidedLabel,
     PluginCardControls,
@@ -171,6 +172,7 @@ class MainWindow(QMainWindow):
     pluginRescanRequested = Signal()
     pluginFoldersRequested = Signal()
     pluginEditorRequested = Signal(int)
+    soundPresetAction = Signal(str, int, str)
 
     def __init__(self, theme: ThemePalette, icon_path: Path | None = None) -> None:
         super().__init__()
@@ -187,6 +189,9 @@ class MainWindow(QMainWindow):
         self._settings_visible = False
         self._controls_visible = False
         self._split_visible = False
+        self._sound_presets_dialog: SoundPresetsDialog | None = None
+        self._sound_preset_rows: tuple[SoundPresetRow, ...] = ()
+        self._sound_preset_learning: int | None = None
         self._plugin_sound_mode = False
         self._plugin_editor_available = False
         self._audio_loading = False
@@ -1055,6 +1060,10 @@ class MainWindow(QMainWindow):
         self.split_toggle_button.setChecked(self._split_visible)
         self.split_toggle_button.clicked.connect(self._on_split_toggle_clicked)
 
+        self.presets_button = FooterButton("", self.footer_bar)
+        self.presets_button.setObjectName("footerIcon")
+        self.presets_button.clicked.connect(self.show_sound_presets)
+
         self.tutorial_button = FooterButton("Tutorial", self.footer_bar)
         self.tutorial_button.setObjectName("footerLink")
         self.tutorial_button.clicked.connect(self.tutorialRequested.emit)
@@ -1071,6 +1080,7 @@ class MainWindow(QMainWindow):
             self.stats_toggle_button,
             self.controls_toggle_button,
             self.split_toggle_button,
+            self.presets_button,
             self.tutorial_button,
             self.website_button,
             self.donate_button,
@@ -1084,6 +1094,8 @@ class MainWindow(QMainWindow):
             (self.settings_toggle_button, "Settings", "Show or hide settings"),
             (self.controls_toggle_button, "Controls", "Show controls"),
             (self.split_toggle_button, "Keyboard split", "Show keyboard split"),
+            (self.presets_button, "Sound presets",
+             "Sound presets: store sounds and recall them with keys of the MIDI keyboard"),
             (self.stats_toggle_button, "Stats", "Hide stats"),
             (self.website_button, "Official website", "Open the OpenPiano website in your browser"),
             (self.tutorial_button, "Tutorial", "Start the guided tutorial"),
@@ -1092,8 +1104,8 @@ class MainWindow(QMainWindow):
             describe_footer_button(button, name, description)
         footer_buttons = (
             self.theme_toggle_button, self.pin_toggle_button, self.settings_toggle_button,
-            self.controls_toggle_button, self.split_toggle_button, self.stats_toggle_button,
-            self.website_button, self.tutorial_button, self.donate_button,
+            self.controls_toggle_button, self.split_toggle_button, self.presets_button,
+            self.stats_toggle_button, self.website_button, self.tutorial_button, self.donate_button,
         )
         for previous, following in zip(footer_buttons, footer_buttons[1:]):
             QWidget.setTabOrder(previous, following)
@@ -1103,6 +1115,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.settings_toggle_button, 0, Qt.AlignLeft)
         row.addWidget(self.controls_toggle_button, 0, Qt.AlignLeft)
         row.addWidget(self.split_toggle_button, 0, Qt.AlignLeft)
+        row.addWidget(self.presets_button, 0, Qt.AlignLeft)
         row.addWidget(self.stats_toggle_button, 0, Qt.AlignLeft)
         row.addStretch(1)
         row.addWidget(self.website_button, 0, Qt.AlignRight)
@@ -1123,6 +1136,7 @@ class MainWindow(QMainWindow):
             (self.settings_toggle_button, "settings"),
             (self.controls_toggle_button, "controls"),
             (self.split_toggle_button, "split"),
+            (self.presets_button, "presets"),
             (self.stats_toggle_button, "stats"),
             (self.website_button, "website"),
         ):
@@ -2771,6 +2785,10 @@ class MainWindow(QMainWindow):
         self.stats_bar.set_theme(theme)
         self.piano_widget.set_theme(theme)
         self._apply_style()
+        dialog = self._sound_presets_dialog
+        if dialog is not None and isValid(dialog):
+            dialog.apply_theme(theme)
+            self._apply_windows_title_bar_theme(dialog)
 
     def set_mode(self, mode: PianoMode) -> None:
         target = self.mode_88_btn if mode == "88" else self.mode_61_btn
@@ -2894,6 +2912,30 @@ class MainWindow(QMainWindow):
             apply_dialog_button_cursors_util(dialog)
             self._apply_windows_title_bar_theme(dialog)
             dialog.exec()
+
+    def show_sound_presets(self) -> None:
+        """Open the sound presets window, or bring it to the front. It is not modal: sounds are
+        chosen in the main window while it stays open."""
+        dialog = self._sound_presets_dialog
+        if dialog is None or not isValid(dialog):
+            dialog = SoundPresetsDialog(self, self.theme)
+            dialog.action.connect(self.soundPresetAction.emit)
+            window_icon = self.windowIcon()
+            if not window_icon.isNull():
+                dialog.setWindowIcon(window_icon)
+            self._sound_presets_dialog = dialog
+        dialog.set_presets(self._sound_preset_rows, self._sound_preset_learning)
+        self._apply_windows_title_bar_theme(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def set_sound_presets(self, rows: list[SoundPresetRow], learning_index: int | None = None) -> None:
+        self._sound_preset_rows = tuple(rows)
+        self._sound_preset_learning = learning_index
+        dialog = self._sound_presets_dialog
+        if dialog is not None and isValid(dialog):
+            dialog.set_presets(self._sound_preset_rows, learning_index)
 
     def ask_plugin_folders(self, default_folders: list[str], folders: list[str]) -> list[str] | None:
         dialog = PluginFoldersDialog(self, self.theme, default_folders, folders)

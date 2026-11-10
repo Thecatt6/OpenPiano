@@ -102,6 +102,12 @@ Click the **Keyboard Split** button in the bottom bar, next to Controls and Sett
 
 A coloured strip above the keys shows where each zone lies. Zones do not layer: where two overlap, the lower-numbered zone plays. A zone applies to the note that sounds, the one that lights up on the piano, so transposing can move a key into or out of a zone.
 
+### Recall sounds from the MIDI keyboard
+
+Click the **Sound Presets** button in the bottom bar, next to Keyboard Split, to open a small window with eight slots. Set up a sound in the main window as usual: the instrument with its bank and preset, and the keyboard split. Then click **Store** in a slot and give it a name. Click **Assign Key…** and press a key of your MIDI keyboard, or a pad or button that sends a controller or a program change: from then on pressing it brings that sound back, also while the window is closed. A key used this way works as a switch and no longer plays its note; **×** next to it gives the key back. **Recall** switches to a preset with the mouse.
+
+A preset keeps the main instrument and all three split zones, with their ranges, volumes and octave shifts. For a VST3 plug-in it also keeps the sound chosen in the plug-in's own window at the moment you click **Store**, for the main instrument and for each zone, so two presets can use the same plug-in with different sounds. Changes made in a plug-in's window later belong to a preset only after storing it again. Volume, transpose and the other settings are not part of a preset. The window can stay open next to the main one while you set up one sound after another. Presets are saved with the settings and are kept by Reset to Defaults.
+
 The included SoundFonts use calibrated preset levels to reduce volume jumps while preserving touch response. 100% is the standard level; the range up to 200% provides additional gain and can engage overload protection during louder playing. WAV export uses the same preset levels.
 
 ### Keep the performance
@@ -159,6 +165,7 @@ py build_exe.py
 - Tutorial step content: [`OpenPiano/openpiano/services/tutorial_flow.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/services/tutorial_flow.py)
 - Application entry point: [`OpenPiano/OpenPiano.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/OpenPiano.py)
 - Keyboard split rules: [`OpenPiano/openpiano/core/split.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/split.py)
+- Sound presets and their MIDI keys: [`OpenPiano/openpiano/core/sound_presets.py`](OpenPiano/openpiano/core/sound_presets.py)
 - VST3 discovery and hosting: [`OpenPiano/openpiano/core/plugin_registry.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/plugin_registry.py), [`OpenPiano/openpiano/core/plugin_host.py`](https://github.com/Justagwas/OpenPiano/blob/main/OpenPiano/openpiano/core/plugin_host.py)
 
 ### Packaging Notes

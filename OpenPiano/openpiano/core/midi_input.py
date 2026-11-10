@@ -35,6 +35,7 @@ class MidiInputManager:
         self._on_event: Callable[[MidiInputEvent], None] | None = None
         self._sequence = 0
         self._pedal_values: dict[int, int] = {}
+        self._controller_values: dict[tuple[int, int], int] = {}
         self._generation = 0
         self._port = None
         self._port_name = ""
@@ -139,6 +140,7 @@ class MidiInputManager:
         with self._message_lock:
             self._generation += 1
             self._pedal_values.clear()
+            self._controller_values.clear()
         if self._watch_stop is not None:
             self._watch_stop.set()
             self._watch_stop = None
@@ -159,11 +161,24 @@ class MidiInputManager:
         if not 0 <= channel <= 15:
             return
         received_at = time.monotonic()
+        if msg_type == 'program_change':
+            # Buttons that send a program change can recall a sound preset.
+            program = int(getattr(message, 'program', -1))
+            if 0 <= program <= 127 and self._on_event is not None:
+                self._emit_event('program_change', channel, program, 127, received_at)
+            return
         if msg_type == 'control_change':
             control = int(getattr(message, 'control', -1))
-            if control not in (64, 120, 121, 123):
-                return
             value = int(getattr(message, 'value', -1))
+            if control not in (64, 120, 121, 123):
+                # Pads and buttons: of use only as sound preset switches. Only the press is
+                # passed on, which also keeps a moving wheel or knob from flooding the queue.
+                if (0 <= control <= 127 and 0 < value <= 127 and self._on_event is not None
+                        and self._controller_values.get((channel, control), 0) == 0):
+                    self._emit_event('controller', channel, control, value, received_at)
+                if 0 <= control <= 127:
+                    self._controller_values[(channel, control)] = max(0, value)
+                return
             if not 0 <= value <= 127:
                 return
             if control == 64:

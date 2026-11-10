@@ -78,6 +78,17 @@ class PluginStateStore:
         except OSError:
             pass
 
+    def clear_slot(self, slot: str) -> None:
+        """Forget what every plug-in saved under this slot."""
+        safe_slot = "".join(char for char in str(slot) if char.isalnum())
+        if not safe_slot:
+            return
+        try:
+            for path in self._folder.glob(f"{safe_slot}-*.bin"):
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
 
 class PluginLoadGuard:
     """Notes which plug-ins are being loaded. An entry that survives into the next start means
@@ -182,6 +193,7 @@ class PluginAudioEngine:
         slot: str = "main",
         state_store: PluginStateStore | None = None,
         load_guard: PluginLoadGuard | None = None,
+        initial_state: bytes | None = None,
         sample_rate: int = AUDIO_SAMPLE_RATE,
         output_factory: Callable[[Callable[[int, int, int], None], int], object] | None = None,
         loader: Callable[[PluginInfo], object] | None = None,
@@ -193,6 +205,10 @@ class PluginAudioEngine:
         self._invoker = invoker or DirectInvoker()
         self._slot = str(slot)
         self._state_store = state_store
+        # Settings to start from instead of the ones last saved for this slot: a sound preset.
+        self._initial_state = bytes(initial_state) if initial_state else None
+        # Held while the plug-in's settings are replaced; the audio thread plays silence then.
+        self._state_lock = threading.Lock()
         self._load_guard = load_guard
         self._output_factory = output_factory or _default_output
         self._loader = loader or _load_pedalboard_plugin
@@ -271,6 +287,13 @@ class PluginAudioEngine:
         raise RuntimeError(f"{self.plugin_info.name} has no mono or stereo output: {first_error}")
 
     def _restore_state(self, plugin) -> None:
+        initial, self._initial_state = self._initial_state, None
+        if initial is not None:
+            try:
+                plugin.raw_state = initial
+                return
+            except Exception:
+                pass
         store = self._state_store
         if store is None:
             return
@@ -295,6 +318,30 @@ class PluginAudioEngine:
     def save_state(self) -> None:
         if self._plugin is not None and not self._closed:
             self._invoker.call(lambda: self._save_state(self._plugin), timeout=_RELEASE_TIMEOUT)
+
+    def capture_state(self) -> bytes | None:
+        """Main thread: the plug-in's settings as they are now, for a sound preset."""
+        plugin = self._plugin
+        if plugin is None or self._closed or not self._invoker.is_main_thread():
+            return None
+        try:
+            return bytes(plugin.raw_state) or None
+        except Exception:
+            return None
+
+    def load_state(self, data: bytes) -> bool:
+        """Main thread: give the loaded plug-in other settings, those of a sound preset.
+        False when the plug-in refused them."""
+        plugin = self._plugin
+        if plugin is None or self._closed or not data or not self._invoker.is_main_thread():
+            return False
+        self.all_notes_off()
+        try:
+            with self._state_lock:
+                plugin.raw_state = bytes(data)
+        except Exception:
+            return False
+        return True
 
     def select_program(self, bank: int = 0, preset: int = 0) -> None:
         return
@@ -360,6 +407,11 @@ class PluginAudioEngine:
             ctypes.memset(left, 0, max(0, size))
             ctypes.memset(right, 0, max(0, size))
             return
+        if not self._state_lock.acquire(blocking=False):
+            # The plug-in is being given other settings right now.
+            ctypes.memset(left, 0, size)
+            ctypes.memset(right, 0, size)
+            return
         try:
             audio = self._render_plugin(plugin, self._drain_midi(), frames, self._channels)
             import numpy
@@ -380,6 +432,8 @@ class PluginAudioEngine:
             self._render_failures += 1
             ctypes.memset(left, 0, size)
             ctypes.memset(right, 0, size)
+        finally:
+            self._state_lock.release()
 
     def start_output(self) -> None:
         if self._closed:

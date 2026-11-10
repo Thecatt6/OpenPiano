@@ -76,6 +76,13 @@ def build_footer_icon(name: str, color: str, size: int, *, checked_color: str | 
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(ink))
             painter.drawRect(QRectF(3.6, 5.6, 5.9, 12.8))
+        elif name == "presets":
+            # Three stored sounds in a list, each with its key.
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(ink))
+            for y in (4, 10.5, 17):
+                painter.drawRoundedRect(QRectF(3, y, 4, 3.4), 1, 1)
+                painter.drawRoundedRect(QRectF(9.5, y + 0.5, 11.5, 2.4), 1.2, 1.2)
         elif name == "stats":
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(ink))

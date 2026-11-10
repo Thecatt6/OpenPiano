@@ -78,7 +78,18 @@ from openpiano.core.settings_store import (
     load_settings,
     save_settings,
 )
-from openpiano.core.split import update_split_zone
+from openpiano.core.sound_presets import (
+    MAX_SOUND_PRESETS,
+    assign_trigger,
+    clear_sound_preset,
+    describe_sound,
+    preset_index_for_trigger,
+    rename_sound_preset,
+    store_sound_preset,
+    trigger_from_event,
+    trigger_label,
+)
+from openpiano.core.split import normalize_split_zones, update_split_zone
 from openpiano.core.stats_logic import collect_stats_values, trim_kps_events
 from openpiano.core.theme import apply_key_color_overrides, get_theme
 from openpiano.services.midi_routing import MidiRoutingService
@@ -94,6 +105,16 @@ from openpiano.services.recording_export import (
     wav_export_args,
 )
 from openpiano.services.tutorial_flow import TutorialFlowService, TutorialStep
+from openpiano.ui.sound_presets_dialog import (
+    ACTION_CANCEL_LEARN,
+    ACTION_CLEAR,
+    ACTION_LEARN,
+    ACTION_RECALL,
+    ACTION_RENAME,
+    ACTION_STORE,
+    ACTION_UNASSIGN,
+    SoundPresetRow,
+)
 from openpiano.services.update_check import UpdateCheckService, UpdateEndpoints
 from openpiano.services.update_payloads import (
     prepared_update_payload,
@@ -192,6 +213,12 @@ class PianoAppController(QObject):
         self._keyboard_input_mode = settings.keyboard_input_mode
         self._keyboard_layout_choice_seen = bool(settings.keyboard_layout_choice_seen)
         self._split_zones = settings.split_zones
+        self._sound_presets = settings.sound_presets
+        # The preset whose "Assign Key" is waiting for a key of the MIDI keyboard.
+        self._preset_learn_index: int | None = None
+        # Plug-in settings a preset being recalled hands to the engines it makes load:
+        # slot -> (instrument id, settings). Read on the audio preparation threads.
+        self._staged_plugin_states: dict[str, tuple[str, bytes]] = {}
         # Plug-ins are created, edited and released on this (the main) thread.
         self._main_thread = MainThreadInvoker(self)
         if plugin_library is None:
@@ -438,6 +465,7 @@ class PianoAppController(QObject):
         self.window.splitZoneChanged.connect(self._on_split_zone_changed)
         self.window.pluginRescanRequested.connect(self._on_plugin_rescan_requested)
         self.window.pluginFoldersRequested.connect(self._on_plugin_folders_requested)
+        self.window.soundPresetAction.connect(self._on_sound_preset_action)
         # Queued: the plug-in window keeps this slot busy for as long as it stays open.
         self.window.pluginEditorRequested.connect(self._on_plugin_editor_requested, Qt.ConnectionType.QueuedConnection)
 
@@ -513,9 +541,14 @@ class PianoAppController(QObject):
             def unavailable():
                 raise RuntimeError("This plug-in is no longer installed.")
             return unavailable
+        options = {}
+        staged = self._staged_plugin_states.get(slot)
+        if staged is not None and staged[0] == instrument_id:
+            # A sound preset is being recalled: start from the settings it stored.
+            options["initial_state"] = staged[1]
         return lambda: self._plugin_engine_factory(
             plugin, invoker=self._main_thread, slot=slot,
-            state_store=library.state_store, load_guard=library.load_guard,
+            state_store=library.state_store, load_guard=library.load_guard, **options,
         )
 
     def _skip_plugins_interrupted_last_time(self) -> None:
@@ -587,6 +620,7 @@ class PianoAppController(QObject):
             self._refresh_plugin_editor_button()
             if self._audio_session.is_latest(result.request):
                 self._audio_request = None
+                self._staged_plugin_states.pop("main", None)
                 self.window.set_audio_loading('')
                 if result.request.persist:
                     self._schedule_persist()
@@ -618,6 +652,7 @@ class PianoAppController(QObject):
             return
         self._audio_handoff = False
         self._audio_request = None
+        self._staged_plugin_states.pop("main", None)
         self.window.set_audio_loading('')
         self.window.set_instruments(self._instruments, self._instrument_id)
         if result.request.startup and not self._startup_fallback_attempted:
@@ -893,6 +928,18 @@ class PianoAppController(QObject):
             return
         if event.sequence <= self._midi_sequence_cutoff or self._tutorial_active:
             return
+        trigger = trigger_from_event(event.kind, event.channel, event.note, event.value)
+        if trigger is not None:
+            # A key given to a sound preset switches sounds and plays no note.
+            if self._preset_learn_index is not None:
+                self._finish_preset_learn(trigger)
+                return
+            preset_index = preset_index_for_trigger(self._sound_presets, trigger)
+            if preset_index is not None:
+                self._recall_sound_preset(preset_index)
+                return
+        if event.kind in ('controller', 'program_change'):
+            return
         source = f'midi:{event.generation}:{event.channel}:{event.note}'
         if event.kind == 'note_on':
             if not self._audio_handoff:
@@ -1023,6 +1070,7 @@ class PianoAppController(QObject):
         self.window.set_instruments(self._instruments, self._instrument_id)
         self.window.set_split_instruments(self._instruments)
         self._configure_split_zones()
+        self._refresh_sound_presets_ui()
         self._piano_download_installed = any(is_hifi_piano(item) for item in self._instruments)
         if not self._piano_download_active:
             self.window.set_piano_download_state(
@@ -1245,12 +1293,233 @@ class PianoAppController(QObject):
             self._split_zones = update_split_zone(self._split_zones, index, bank=state.bank, preset=state.preset)
             self._schedule_persist()
         self.window.set_split_zone_state(index, state)
+        if state.status != "loading":
+            self._staged_plugin_states.pop(f"zone{index + 1}", None)
         if index == self._pending_zone_editor and state.status != "loading":
             self._pending_zone_editor = None
             if state.status == "ready" and state.is_plugin and state.instrument_id == zone.instrument_id:
                 # Through the queue, like a click: the plug-in window keeps its caller busy
                 # for as long as it stays open.
                 self.window.pluginEditorRequested.emit(index)
+
+    # ----- Sound presets: stored sounds, each recalled by a key of the MIDI keyboard.
+
+    def _refresh_sound_presets_ui(self) -> None:
+        rows = [
+            SoundPresetRow(stored=preset.stored, name=preset.name, summary=preset.summary,
+                           key=trigger_label(preset.trigger))
+            for preset in self._sound_presets
+        ]
+        self.window.set_sound_presets(rows, self._preset_learn_index)
+
+    def _on_sound_preset_action(self, action: str, index: int, text: str) -> None:
+        index = int(index)
+        if self._is_shutdown or not 0 <= index < MAX_SOUND_PRESETS:
+            return
+        if action == ACTION_CANCEL_LEARN:
+            if self._preset_learn_index is not None:
+                self._preset_learn_index = None
+                self._refresh_sound_presets_ui()
+            return
+        if self._tutorial_active:
+            return
+        if action == ACTION_STORE:
+            self._store_sound_preset(index)
+        elif action == ACTION_RECALL:
+            self._recall_sound_preset(index, interactive=True)
+        elif action == ACTION_CLEAR:
+            self._clear_sound_preset(index)
+        elif action == ACTION_RENAME:
+            self._set_sound_presets(rename_sound_preset(self._sound_presets, index, text))
+        elif action == ACTION_UNASSIGN:
+            self._set_sound_presets(assign_trigger(self._sound_presets, index, None))
+        elif action == ACTION_LEARN:
+            if not self._sound_presets[index].stored:
+                return
+            self._preset_learn_index = index
+            self._refresh_sound_presets_ui()
+            if not self._midi_manager.current_device():
+                self.window.show_warning(
+                    "Sound Presets",
+                    "No MIDI keyboard is connected to OpenPiano yet.\n"
+                    "Choose it under Controls, \"MIDI In\", then press the key to assign.")
+
+    def _set_sound_presets(self, presets) -> None:
+        if self._preset_learn_index is not None and not presets[self._preset_learn_index].stored:
+            self._preset_learn_index = None
+        changed = presets != self._sound_presets
+        self._sound_presets = presets
+        self._refresh_sound_presets_ui()
+        if changed:
+            self._schedule_persist()
+
+    def _finish_preset_learn(self, trigger) -> None:
+        index, self._preset_learn_index = self._preset_learn_index, None
+        if index is None:
+            return
+        self._set_sound_presets(assign_trigger(self._sound_presets, index, trigger))
+
+    def _instrument_display_name(self, instrument_id: str) -> str:
+        instrument = self._instrument_by_id.get(instrument_id)
+        if instrument is not None:
+            return instrument.name
+        return self._plugin_display_name(instrument_id) if is_plugin_instrument_id(instrument_id) else ""
+
+    def _describe_current_sound(self) -> str:
+        program = ""
+        if not is_plugin_instrument_id(self._instrument_id):
+            program = self._available_program_names.get(self._instrument_bank, {}).get(self._instrument_preset, "")
+        zone_names: list[str] = []
+        for index, zone in enumerate(self._split_zones):
+            name = self._instrument_display_name(zone.instrument_id)
+            state = self._split_manager.state(index)
+            if zone.enabled and state.status == "ready" and not state.is_plugin:
+                zone_program = state.program_names.get(zone.bank, {}).get(zone.preset, "")
+                if zone_program:
+                    name = f"{name} – {zone_program}"
+            zone_names.append(name)
+        return describe_sound(self._instrument_display_name(self._instrument_id), str(program or ""),
+                              self._split_zones, zone_names)
+
+    @staticmethod
+    def _preset_state_slot(index: int, slot: str) -> str:
+        return f"preset{int(index) + 1:02d}{slot}"
+
+    def _plugin_state_store(self):
+        return getattr(self._plugin_library, "state_store", None)
+
+    def _clear_preset_plugin_states(self, index: int) -> None:
+        store = self._plugin_state_store()
+        if store is None:
+            return
+        for slot in ("main", *(f"zone{number + 1}" for number in range(len(self._split_zones)))):
+            store.clear_slot(self._preset_state_slot(index, slot))
+
+    def _capture_preset_plugin_states(self, index: int) -> None:
+        """A plug-in chooses its sound in its own window, so a preset keeps a copy of the
+        settings of every plug-in it uses, taken now."""
+        store = self._plugin_state_store()
+        if store is None:
+            return
+        self._clear_preset_plugin_states(index)
+        preset = self._sound_presets[index]
+        slots: list[tuple[str, str, object]] = []
+        if is_plugin_instrument_id(preset.instrument_id):
+            slots.append(("main", preset.instrument_id, self.audio_engine))
+        for zone_index, zone in enumerate(preset.zones):
+            if not zone.enabled or not is_plugin_instrument_id(zone.instrument_id):
+                continue
+            state = self._split_manager.state(zone_index)
+            loaded = state.status == "ready" and state.instrument_id == zone.instrument_id
+            slots.append((f"zone{zone_index + 1}", zone.instrument_id,
+                          self._split_manager.engine(zone_index) if loaded else None))
+        for slot, instrument_id, engine in slots:
+            capture = getattr(engine, "capture_state", None)
+            data = capture() if callable(capture) else None
+            if not data:
+                # Not loaded right now: what it last saved for this place is the best there is.
+                data = store.load(slot, instrument_id)
+            if data:
+                store.save(self._preset_state_slot(index, slot), instrument_id, data)
+
+    def _preset_plugin_state(self, index: int, slot: str, instrument_id: str) -> bytes | None:
+        store = self._plugin_state_store()
+        if store is None or not is_plugin_instrument_id(instrument_id):
+            return None
+        return store.load(self._preset_state_slot(index, slot), instrument_id)
+
+    def _load_plugin_state(self, engine, data: bytes) -> None:
+        loader = getattr(engine, "load_state", None)
+        if not callable(loader):
+            return
+        self._stop_all_notes(preserve_pedal=True)
+        try:
+            loader(data)
+        except Exception as exc:
+            _ = exc
+
+    def _store_sound_preset(self, index: int) -> None:
+        if self._audio_request is not None or self._audio_handoff:
+            self.window.show_warning("Sound Presets", "The instrument is still loading. Store the preset once it is ready.")
+            return
+        if not self._instrument_id:
+            self.window.show_warning("Sound Presets", "There is no sound to store yet. Choose an instrument first.")
+            return
+        presets = store_sound_preset(
+            self._sound_presets, index,
+            instrument_id=self._instrument_id, bank=self._instrument_bank, preset=self._instrument_preset,
+            zones=self._split_zones, summary=self._describe_current_sound())
+        self._sound_presets = presets
+        self._capture_preset_plugin_states(index)
+        self._refresh_sound_presets_ui()
+        self._schedule_persist()
+
+    def _clear_sound_preset(self, index: int) -> None:
+        self._clear_preset_plugin_states(index)
+        self._set_sound_presets(clear_sound_preset(self._sound_presets, index))
+
+    def _recall_sound_preset(self, index: int, *, interactive: bool = False) -> bool:
+        """Switch to a stored sound: the main instrument, then the keyboard split."""
+        if (self._is_shutdown or self._tutorial_active or not 0 <= index < len(self._sound_presets)
+                or self._audio_session.terminal_error is not None):
+            return False
+        preset = self._sound_presets[index]
+        if not preset.stored:
+            return False
+        self._pending_zone_editor = None
+        self._pending_plugin_instrument_id = ""
+        self._staged_plugin_states.clear()
+
+        instrument = self._instrument_by_id.get(preset.instrument_id)
+        if instrument is not None:
+            state = self._preset_plugin_state(index, "main", instrument.id)
+            settled = self._audio_request is None and not self._audio_handoff
+            if settled and instrument.id == self._instrument_id:
+                # Already loaded: only the sound inside it may differ.
+                if state is not None:
+                    self._load_plugin_state(self.audio_engine, state)
+                elif (not is_plugin_instrument_id(instrument.id)
+                        and (preset.bank, preset.preset) != (self._instrument_bank, self._instrument_preset)):
+                    self._apply_program_selection(preset.bank, preset.preset, persist=False)
+            else:
+                if state is not None:
+                    self._staged_plugin_states["main"] = (instrument.id, state)
+                self._apply_instrument_selection(instrument.id, preset.bank, preset.preset, persist=True)
+
+        zones = normalize_split_zones(preset.zones)
+        reload_zones: list[int] = []
+        live_zones: list[tuple[int, bytes]] = []
+        for zone_index, zone in enumerate(zones):
+            slot = f"zone{zone_index + 1}"
+            state = self._preset_plugin_state(index, slot, zone.instrument_id) if zone.enabled else None
+            if state is None:
+                continue
+            current = self._split_manager.state(zone_index)
+            same_plugin = self._split_zones[zone_index].enabled and current.instrument_id == zone.instrument_id
+            if same_plugin and current.status == "ready" and self._split_manager.engine(zone_index) is not None:
+                live_zones.append((zone_index, state))
+                continue
+            self._staged_plugin_states[slot] = (zone.instrument_id, state)
+            if same_plugin and current.status == "loading":
+                # It may have read its settings already; load it again from the preset's.
+                reload_zones.append(zone_index)
+        self._split_zones = zones
+        self._configure_split_zones()
+        for zone_index in reload_zones:
+            self._split_manager.retry(zone_index, self._instrument_by_id)
+        for zone_index, state in live_zones:
+            engine = self._split_manager.engine(zone_index)
+            if engine is not None:
+                self._load_plugin_state(engine, state)
+        self._schedule_persist()
+
+        if interactive and instrument is None:
+            name = self._instrument_display_name(preset.instrument_id) or "its instrument"
+            self.window.show_warning(
+                "Sound Presets",
+                f"“{preset.name}” uses {name}, which is not available any more. "
+                "The main sound was left as it is.")
+        return True
 
     def _zone_plugin_window_ready(self, index: int) -> bool:
         """True when the zone's plug-in is loaded and its window can be opened now. If it is
@@ -2056,6 +2325,9 @@ class PianoAppController(QObject):
         self._keyboard_input_mode = defaults.keyboard_input_mode
         self._keyboard_layout_choice_seen = defaults.keyboard_layout_choice_seen
         self._split_zones = defaults.split_zones
+        # Stored sound presets are kept: they are the user's work, not a setting.
+        self._preset_learn_index = None
+        self._staged_plugin_states.clear()
         self._pending_plugin_instrument_id = ""
         self._default_keybind_map_full = build_default_keybind_map_full(self._keyboard_input_mode)
         self._custom_keybind_overrides = {}
@@ -3011,6 +3283,7 @@ class PianoAppController(QObject):
             split_zones=self._split_zones,
             plugin_folders=self._plugin_folders,
             split_open=self._tutorial_prev_split_open if self._tutorial_active else self._split_open,
+            sound_presets=self._sound_presets,
         )
         try:
             save_settings(settings, self._settings_path)
