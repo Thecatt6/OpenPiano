@@ -66,6 +66,9 @@ from openpiano.core.music_logic import clamp_transposed_note
 from openpiano.core.midi_input import MidiInputEvent, MidiInputManager
 from openpiano.core.midi_recording import MidiRecorder
 from openpiano.core.piano_pedal import PedalState
+from openpiano.core.plugin_host import PluginAudioEngine
+from openpiano.core.plugin_registry import is_plugin_instrument_id
+from openpiano.core.plugin_window import PluginWindowPlacer
 from openpiano.core.object_tree import is_descendant_of
 from openpiano.core.program_selection import normalize_available_programs, normalize_program_selection
 from openpiano.core.runtime_paths import icon_path_candidates
@@ -75,11 +78,15 @@ from openpiano.core.settings_store import (
     load_settings,
     save_settings,
 )
+from openpiano.core.split import update_split_zone
 from openpiano.core.stats_logic import collect_stats_values, trim_kps_events
 from openpiano.core.theme import apply_key_color_overrides, get_theme
 from openpiano.services.midi_routing import MidiRoutingService
 from openpiano.services.note_lifecycle import NoteLifecycleService
 from openpiano.services.audio_session import AudioSession
+from openpiano.services.main_thread import MainThreadInvoker
+from openpiano.services.plugin_library import PluginLibrary
+from openpiano.services.split_zones import SplitZoneManager
 from openpiano.services.piano_download import PianoDownloadService, d274_download_spec
 from openpiano.services.recording_export import (
     destination_with_selected_suffix,
@@ -100,6 +107,7 @@ AudioFactory = Callable[[], AudioEngineProtocol]
 InstrumentProvider = Callable[[], list[InstrumentInfo]]
 MidiManagerFactory = Callable[[Callable[[int, int], None], Callable[[int], None]], MidiInputManager]
 RecorderFactory = Callable[[], MidiRecorder]
+PluginEngineFactory = Callable[..., AudioEngineProtocol]
 
 
 class PianoAppController(QObject):
@@ -127,11 +135,14 @@ class PianoAppController(QObject):
         settings_path: Path | None = None,
         icon_path: Path | None = None,
         startup_status: Callable[[str], None] | None = None,
+        plugin_library: PluginLibrary | None = None,
+        plugin_engine_factory: PluginEngineFactory | None = None,
     ) -> None:
         super().__init__()
         report_startup = startup_status or (lambda _message: None)
         self._app = app
         self._audio_factory = audio_factory or FluidSynthAudioEngine
+        self._plugin_engine_factory = plugin_engine_factory or PluginAudioEngine
         self._instrument_provider = instrument_provider or discover_instruments
         self._midi_manager_factory = midi_manager_factory or MidiInputManager
         self._recorder_factory = recorder_factory or MidiRecorder
@@ -157,6 +168,7 @@ class PianoAppController(QObject):
         self._show_stats = bool(settings.show_stats)
         self._controls_open = bool(settings.controls_open)
         self._settings_open = False
+        self._split_open = bool(settings.split_open)
         self._transpose = int(settings.transpose)
         self._sustain_percent = int(settings.sustain_percent)
         self._sustain_fade = max(0, min(100, int(settings.sustain_fade)))
@@ -179,6 +191,19 @@ class PianoAppController(QObject):
         self._window_y = settings.window_y
         self._keyboard_input_mode = settings.keyboard_input_mode
         self._keyboard_layout_choice_seen = bool(settings.keyboard_layout_choice_seen)
+        self._split_zones = settings.split_zones
+        # Plug-ins are created, edited and released on this (the main) thread.
+        self._main_thread = MainThreadInvoker(self)
+        if plugin_library is None:
+            self._plugin_library = PluginLibrary(folders=settings.plugin_folders, parent=self)
+        else:
+            self._plugin_library = plugin_library
+        self._plugin_folders = tuple(self._plugin_library.folders)
+        self._plugin_startup_notice = ""
+        self._pending_plugin_instrument_id = ""
+        # The zone whose plug-in window was asked for before its plug-in had loaded.
+        self._pending_zone_editor: int | None = None
+        self._skip_plugins_interrupted_last_time()
         self._space_override_off = False
         self._pedal_state = PedalState()
         self._midi_input_epoch = 0
@@ -229,6 +254,7 @@ class PianoAppController(QObject):
         self._tutorial_index = 0
         self._tutorial_prev_settings_open = False
         self._tutorial_prev_controls_open = False
+        self._tutorial_prev_split_open = False
         self._tutorial_prev_stats_visible = self._show_stats
         self._tutorial_prev_mode: PianoMode = self._mode
         self._tutorial_flow = TutorialFlowService()
@@ -342,7 +368,14 @@ class PianoAppController(QObject):
         self._init_audio_engine()
         report_startup("Finding available instruments...")
         self._refresh_instruments()
+        if (is_plugin_instrument_id(self._instrument_id) and self._plugin_library.available
+                and self._instrument_id not in self._instrument_by_id):
+            # Not in the cached plug-in list: pick it up again if the next scan finds it.
+            self._pending_plugin_instrument_id = self._instrument_id
         self._apply_startup_instrument()
+        self._plugin_library.changed.connect(self._on_plugin_library_changed)
+        self._plugin_library.statusChanged.connect(self._refresh_plugin_status)
+        self._refresh_plugin_status()
         report_startup("Checking MIDI devices...")
         self._refresh_midi_inputs()
         self._restore_midi_input_device(persist=False, show_warning=False)
@@ -383,6 +416,7 @@ class PianoAppController(QObject):
         self.window.checkUpdatesNowRequested.connect(lambda: self._trigger_update_check(manual=True))
         self.window.settingsToggled.connect(self._on_settings_toggled)
         self.window.controlsToggled.connect(self._on_controls_toggled)
+        self.window.splitToggled.connect(self._on_split_toggled)
         self.window.statsToggled.connect(self._on_stats_toggled)
         self.window.midiInputDeviceChanged.connect(self._on_midi_input_device_changed)
         self.window.midiInputDropdownOpened.connect(self._on_midi_input_dropdown_opened)
@@ -401,6 +435,11 @@ class PianoAppController(QObject):
         self.window.pianoDownloadCanceled.connect(self._cancel_piano_download)
         self.window.resetKeyColorsRequested.connect(self._on_reset_key_colors_requested)
         self.window.updateProgressCanceled.connect(self._on_update_progress_canceled)
+        self.window.splitZoneChanged.connect(self._on_split_zone_changed)
+        self.window.pluginRescanRequested.connect(self._on_plugin_rescan_requested)
+        self.window.pluginFoldersRequested.connect(self._on_plugin_folders_requested)
+        # Queued: the plug-in window keeps this slot busy for as long as it stays open.
+        self.window.pluginEditorRequested.connect(self._on_plugin_editor_requested, Qt.ConnectionType.QueuedConnection)
 
         self.window.piano_widget.notePressed.connect(self._on_mouse_note_pressed)
         self.window.piano_widget.noteReleased.connect(self._on_mouse_note_released)
@@ -421,7 +460,7 @@ class PianoAppController(QObject):
         self.window.set_animation_speed(self._animation_speed)
         self.window.set_auto_check_updates(self._auto_check_updates)
         self.window.set_stats_visible(self._show_stats)
-        self.window.set_settings_visible(self._settings_open)
+        self._apply_tall_panels()
         self.window.set_controls_visible(self._controls_open)
         self.window.set_recording_state(active=False, has_take=False)
         self.window.set_key_color("white_key", self._white_key_color)
@@ -447,11 +486,67 @@ class PianoAppController(QObject):
 
     def _init_audio_engine(self) -> None:
         factory = (lambda: FluidSynthAudioEngine(start_output=False)) if self._audio_factory is FluidSynthAudioEngine else self._audio_factory
-        self._audio_session = AudioSession(factory, self.audio_engine, self)
+        self._engine_factory = factory
+        self._audio_session = AudioSession(factory, self.audio_engine, self,
+                                           factory_for=lambda request: self._engine_factory_for(request, "main"))
         self._audio_session.prepared.connect(self._on_audio_prepared, Qt.ConnectionType.QueuedConnection)
         self._audio_session.activated.connect(self._on_audio_activated, Qt.ConnectionType.QueuedConnection)
         self._audio_session.failed.connect(self._on_audio_preparation_failed, Qt.ConnectionType.QueuedConnection)
+        self._split_manager = SplitZoneManager(self._create_zone_session, self)
+        self._split_manager.zoneStateChanged.connect(self._on_split_zone_state_changed)
         self._audio_health_timer.start()
+
+    def _create_zone_session(self, index: int) -> AudioSession:
+        slot = f"zone{int(index) + 1}"
+        return AudioSession(self._engine_factory, None, self,
+                            factory_for=lambda request: self._engine_factory_for(request, slot))
+
+    def _engine_factory_for(self, request, slot: str):
+        """Audio preparation thread: the engine factory for a plug-in instrument, or None when
+        the request is for a SoundFont."""
+        instrument_id = str(request.instrument_id)
+        if not is_plugin_instrument_id(instrument_id):
+            return None
+        library = self._plugin_library
+        plugin = library.plugin_for(instrument_id)
+        if plugin is None:
+            def unavailable():
+                raise RuntimeError("This plug-in is no longer installed.")
+            return unavailable
+        return lambda: self._plugin_engine_factory(
+            plugin, invoker=self._main_thread, slot=slot,
+            state_store=library.state_store, load_guard=library.load_guard,
+        )
+
+    def _skip_plugins_interrupted_last_time(self) -> None:
+        # A plug-in still marked as loading means OpenPiano died while loading it. Loading it
+        # again on every start would leave the app unable to open, so it is left out once.
+        try:
+            interrupted = self._plugin_library.load_guard.take_interrupted()
+        except Exception:
+            interrupted = set()
+        if not interrupted:
+            return
+        names: list[str] = []
+        if self._instrument_id in interrupted:
+            names.append(self._plugin_display_name(self._instrument_id))
+            self._instrument_id = ""
+        for index, zone in enumerate(self._split_zones):
+            if zone.enabled and zone.instrument_id in interrupted:
+                names.append(self._plugin_display_name(zone.instrument_id))
+                self._split_zones = update_split_zone(self._split_zones, index, enabled=False)
+        if names:
+            listed = "\n".join(f"  • {name}" for name in dict.fromkeys(names))
+            self._plugin_startup_notice = (
+                "OpenPiano closed unexpectedly while loading a plug-in last time, so it was not "
+                f"loaded again:\n\n{listed}\n\nYou can still select it by hand."
+            )
+
+    def _plugin_display_name(self, instrument_id: str) -> str:
+        plugin = self._plugin_library.plugin_for(instrument_id)
+        if plugin is not None:
+            return plugin.display_name
+        return str(instrument_id).rpartition("::")[2] or str(instrument_id)
 
     def _on_audio_prepared(self, result) -> None:
         if self._is_shutdown or not self._audio_session.is_latest(result.request):
@@ -489,6 +584,7 @@ class PianoAppController(QObject):
             self._audio_startup_error = ''
             self.window.set_instruments(self._instruments, self._instrument_id)
             self._refresh_program_controls()
+            self._refresh_plugin_editor_button()
             if self._audio_session.is_latest(result.request):
                 self._audio_request = None
                 self.window.set_audio_loading('')
@@ -513,6 +609,8 @@ class PianoAppController(QObject):
             self._audio_health_timer.stop()
             self.window.set_audio_loading('')
             self.window.set_instruments(self._instruments, self._instrument_id)
+            self._refresh_plugin_editor_button()
+            self._split_manager.close()
             self._audio_session.close()
             self.window.show_warning('Audio Error', f'Audio cleanup failed. Please restart OpenPiano.\n{result.error}')
             return
@@ -536,7 +634,10 @@ class PianoAppController(QObject):
             self.window.show_warning('Instrument Error', f'Failed to load instrument:\n{result.error}')
 
     def _poll_audio_health(self) -> None:
-        if self._is_shutdown or self._audio_handoff or self._audio_error_reported:
+        if self._is_shutdown:
+            return
+        self._split_manager.poll_health()
+        if self._audio_handoff or self._audio_error_reported:
             return
         try:
             count = getattr(self.audio_engine, 'failure_count', lambda: 0)()
@@ -580,8 +681,18 @@ class PianoAppController(QObject):
 
     def wait_for_audio_shutdown(self, timeout=None) -> bool:
         started = time.monotonic()
-        if not self._audio_session.wait_closed(timeout):
-            return False
+        # Plug-in engines are released on this thread, so their requests have to be served
+        # here while the audio threads wind down.
+        while True:
+            self._main_thread.drain()
+            sessions_closed = self._audio_session.wait_closed(0.02)
+            zones_closed = self._split_manager.wait_closed(0.0, pump=self._main_thread.drain)
+            scan_closed = self._plugin_library.wait_closed(0.0)
+            if sessions_closed and zones_closed and scan_closed:
+                break
+            if timeout is not None and time.monotonic() - started >= timeout:
+                return False
+        self._main_thread.drain()
         for worker in (self._recording_save_thread, self._piano_download_thread):
             if worker is not None and worker is not threading.current_thread():
                 remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
@@ -851,6 +962,9 @@ class PianoAppController(QObject):
                     setter(value)
             except Exception as exc:
                 self._report_audio_error(exc)
+        split_manager = getattr(self, '_split_manager', None)
+        if split_manager is not None:
+            split_manager.set_pedal(value, recapture_owned=recapture_owned, emit_contacts=source != 'panic')
         self._recorder.add_pedal(value, controls_damping=pedal.controls_damping,
             source=source, input_value=value if input_value is None else input_value,
             timestamp=timestamp, recapture_owned=recapture_owned)
@@ -900,8 +1014,15 @@ class PianoAppController(QObject):
         except Exception as exc:
             self._instruments = []
             _ = exc
+        try:
+            known = {item.id for item in self._instruments}
+            self._instruments.extend(item for item in self._plugin_library.instruments() if item.id not in known)
+        except Exception as exc:
+            _ = exc
         self._instrument_by_id = {item.id: item for item in self._instruments}
         self.window.set_instruments(self._instruments, self._instrument_id)
+        self.window.set_split_instruments(self._instruments)
+        self._configure_split_zones()
         self._piano_download_installed = any(is_hifi_piano(item) for item in self._instruments)
         if not self._piano_download_active:
             self.window.set_piano_download_state(
@@ -1079,6 +1200,161 @@ class PianoAppController(QObject):
             self._schedule_persist()
         return True
 
+    def _configure_split_zones(self) -> None:
+        self.window.set_split_zones(self._split_zones)
+        if self._is_shutdown:
+            return
+        self._split_manager.configure(self._split_zones, self._instrument_by_id, self._volume)
+        for index in range(len(self._split_zones)):
+            self.window.set_split_zone_state(index, self._split_manager.state(index))
+
+    def _on_split_zone_changed(self, index: int, changes: object) -> None:
+        if self._is_shutdown or not isinstance(changes, dict):
+            return
+        index = int(index)
+        if not 0 <= index < len(self._split_zones):
+            return
+        changes = dict(changes)
+        current = self._split_zones[index]
+        if index == self._pending_zone_editor and ("instrument_id" in changes or changes.get("enabled") is False):
+            self._pending_zone_editor = None
+        if changes.get("enabled") and not current.enabled and not current.instrument_id \
+                and "instrument_id" not in changes:
+            # A zone needs a sound to be audible: start from the default SoundFont.
+            starter = select_fallback_instrument(
+                [item for item in self._instruments if item.source != "plugin"] or self._instruments)
+            if starter is not None:
+                changes.update(instrument_id=starter.id, bank=starter.default_bank, preset=starter.default_preset)
+        zones = update_split_zone(self._split_zones, index, **changes)
+        if zones == self._split_zones:
+            self.window.set_split_zones(self._split_zones)
+            return
+        self._split_zones = zones
+        self._configure_split_zones()
+        self._schedule_persist()
+
+    def _on_split_zone_state_changed(self, index: int) -> None:
+        if self._is_shutdown:
+            return
+        index = int(index)
+        state = self._split_manager.state(index)
+        zone = self._split_zones[index]
+        if (state.status == "ready" and state.instrument_id == zone.instrument_id
+                and (state.bank, state.preset) != (zone.bank, zone.preset)):
+            # The engine may settle on another program than the one asked for.
+            self._split_zones = update_split_zone(self._split_zones, index, bank=state.bank, preset=state.preset)
+            self._schedule_persist()
+        self.window.set_split_zone_state(index, state)
+        if index == self._pending_zone_editor and state.status != "loading":
+            self._pending_zone_editor = None
+            if state.status == "ready" and state.is_plugin and state.instrument_id == zone.instrument_id:
+                # Through the queue, like a click: the plug-in window keeps its caller busy
+                # for as long as it stays open.
+                self.window.pluginEditorRequested.emit(index)
+
+    def _zone_plugin_window_ready(self, index: int) -> bool:
+        """True when the zone's plug-in is loaded and its window can be opened now. If it is
+        not, the zone is switched on when it was off, and the window opens by itself as soon
+        as the plug-in has loaded."""
+        if not 0 <= index < len(self._split_zones):
+            return False
+        zone = self._split_zones[index]
+        if not is_plugin_instrument_id(zone.instrument_id):
+            return False
+        if not zone.enabled:
+            self._on_split_zone_changed(index, {"enabled": True})
+        state = self._split_manager.state(index)
+        if state.status == "ready":
+            return True
+        self._pending_zone_editor = index if state.status == "loading" else None
+        return False
+
+    def _refresh_plugin_status(self) -> None:
+        library = self._plugin_library
+        self.window.set_plugin_status(library.status_text(), library.details_text(),
+                                      available=library.available, scanning=library.scanning)
+
+    def _refresh_plugin_editor_button(self) -> None:
+        self.window.set_plugin_editor_available(
+            self.audio_available and callable(getattr(self.audio_engine, 'open_editor', None)))
+
+    def _on_plugin_library_changed(self) -> None:
+        if self._is_shutdown:
+            return
+        self._refresh_instruments()
+        self._refresh_plugin_status()
+        pending, self._pending_plugin_instrument_id = self._pending_plugin_instrument_id, ""
+        if pending and pending in self._instrument_by_id:
+            self._apply_instrument_selection(pending, 0, 0, persist=True)
+            return
+        if (self._instrument_id and self._instrument_id not in self._instrument_by_id
+                and self._audio_request is None and is_plugin_instrument_id(self._instrument_id)):
+            # The plug-in that is playing has been removed: go back to a sound that exists.
+            fallback = select_fallback_instrument(self._instruments)
+            if fallback is not None:
+                self._apply_instrument_selection(fallback.id, fallback.default_bank, fallback.default_preset,
+                                                 persist=True)
+
+    def _on_plugin_rescan_requested(self) -> None:
+        if self._is_shutdown:
+            return
+        self._plugin_library.rescan(force=True)
+
+    def _on_plugin_folders_requested(self) -> None:
+        if self._is_shutdown:
+            return
+        library = self._plugin_library
+        folders = self.window.ask_plugin_folders(list(library.default_folders), list(library.folders))
+        if folders is None or self._is_shutdown:
+            return
+        if library.set_folders(folders):
+            self._plugin_folders = tuple(library.folders)
+            self._schedule_persist()
+        library.rescan()
+
+    def _on_plugin_editor_requested(self, index: int) -> None:
+        if self._is_shutdown:
+            return
+        index = int(index)
+        if index >= 0 and not self._zone_plugin_window_ready(index):
+            return
+        engine = self.audio_engine if index < 0 else self._split_manager.engine(index)
+        opener = getattr(engine, 'open_editor', None)
+        if not callable(opener) or getattr(engine, 'editor_open', False):
+            return
+        # The plug-in window runs its own loop until it is closed. On Windows that loop also
+        # serves this application; elsewhere it has to be kept alive from here.
+        keep_alive = None if sys.platform == 'win32' else QApplication.processEvents
+        # The host opens the window with its title bar above the top of the screen and under
+        # its own name; this brings it next to OpenPiano and names it after the plug-in.
+        placer = PluginWindowPlacer(self._plugin_window_title(engine, index), self._main_window_handle())
+
+        def on_poll() -> None:
+            placer.poll()
+            if keep_alive is not None:
+                keep_alive()
+
+        try:
+            opener(on_poll)
+        except Exception as exc:
+            if not self._is_shutdown:
+                self.window.show_warning("Plug-in", f"The plug-in window could not be opened.\n\n{exc}")
+
+    def _plugin_window_title(self, engine, index: int) -> str:
+        name = str(getattr(engine, 'plugin_name', '') or '').strip() or "Plug-in"
+        if index >= 0:
+            return f"{name} – Zone {index + 1} – {APP_NAME}"
+        return f"{name} – {APP_NAME}"
+
+    def _main_window_handle(self) -> int:
+        """The native handle of the main window, which tells the plug-in window's screen."""
+        if sys.platform != 'win32':
+            return 0
+        try:
+            return int(self.window.winId())
+        except Exception:
+            return 0
+
     def _on_mode_changed(self, mode: str) -> None:
         new_mode: PianoMode = "88" if mode == "88" else "61"
         if new_mode == self._mode:
@@ -1117,6 +1393,7 @@ class PianoAppController(QObject):
             self._schedule_persist()
 
     def _on_instrument_changed(self, instrument_id: str) -> None:
+        self._pending_plugin_instrument_id = ""
         self._apply_instrument_selection(
             instrument_id,
             self._instrument_bank,
@@ -1159,7 +1436,10 @@ class PianoAppController(QObject):
         self._schedule_persist()
 
     def _apply_desired_volume(self) -> None:
-        if not self._is_shutdown and not self._audio_handoff:
+        if self._is_shutdown:
+            return
+        self._split_manager.set_master_volume(self._volume)
+        if not self._audio_handoff:
             self.audio_engine.set_master_volume(self._volume)
 
     def _on_velocity_changed(self, value: int) -> None:
@@ -1420,11 +1700,37 @@ class PianoAppController(QObject):
         self.window.set_theme_mode(self._theme_mode)
         self._refresh_stats_ui()
 
+    def _apply_tall_panels(self) -> None:
+        self.window.set_split_visible(self._split_open)
+        self.window.set_settings_visible(self._settings_open)
+
+    def _show_settings_panel(self, visible: bool) -> None:
+        # Settings and Keyboard Split take each other's place in the window, which keeps it
+        # from growing past the screen when both are wanted.
+        self._settings_open = bool(visible)
+        if self._settings_open:
+            self._split_open = False
+        self._apply_tall_panels()
+
+    def _show_split_panel(self, visible: bool) -> None:
+        self._split_open = bool(visible)
+        if self._split_open:
+            self._settings_open = False
+        self._apply_tall_panels()
+
     def _on_settings_toggled(self, visible: bool) -> None:
         if self._tutorial_active:
             return
-        self._settings_open = bool(visible)
-        self.window.set_settings_visible(self._settings_open)
+        split_was_open = self._split_open
+        self._show_settings_panel(visible)
+        if self._split_open != split_was_open:
+            self._schedule_persist()
+
+    def _on_split_toggled(self, visible: bool) -> None:
+        if self._tutorial_active:
+            return
+        self._show_split_panel(visible)
+        self._schedule_persist()
 
     def _on_controls_toggled(self, visible: bool) -> None:
         if self._tutorial_active:
@@ -1513,6 +1819,12 @@ class PianoAppController(QObject):
             except RuntimeError as exc:
                 self.window.show_warning("Recording", str(exc))
                 return
+            if self._split_manager.active and not self.window.ask_yes_no(
+                "Recording",
+                "WAV export plays every note with the main instrument, so the split zones will "
+                "not be heard in the file.\n\nExport anyway?",
+            ):
+                return
 
         self._recording_save_active = True
         self._recording_save_stop_event.clear()
@@ -1584,6 +1896,7 @@ class PianoAppController(QObject):
         self._sync_tutorial_state_from_service()
         self._tutorial_prev_settings_open = self._settings_open
         self._tutorial_prev_controls_open = self._controls_open
+        self._tutorial_prev_split_open = self._split_open
         self._tutorial_prev_stats_visible = self._show_stats
         self._tutorial_prev_mode = self._mode
         self._stop_all_notes()
@@ -1598,8 +1911,7 @@ class PianoAppController(QObject):
             if step is None:
                 break
             if bool(step.get("open_settings")) and not self._settings_open:
-                self._settings_open = True
-                self.window.set_settings_visible(True)
+                self._show_settings_panel(True)
             if bool(step.get("open_controls")) and not self._controls_open:
                 self._controls_open = True
                 self.window.set_controls_visible(True)
@@ -1668,10 +1980,10 @@ class PianoAppController(QObject):
         self._sync_tutorial_state_from_service()
         self.window.set_tutorial_mode(False)
 
-        restore_settings_open = bool(self._tutorial_prev_settings_open)
-        if self._settings_open != restore_settings_open:
-            self._settings_open = restore_settings_open
-            self.window.set_settings_visible(self._settings_open)
+        restore_tall_panels = (bool(self._tutorial_prev_settings_open), bool(self._tutorial_prev_split_open))
+        if (self._settings_open, self._split_open) != restore_tall_panels:
+            self._settings_open, self._split_open = restore_tall_panels
+            self._apply_tall_panels()
 
         restore_controls_open = bool(self._tutorial_prev_controls_open)
         if self._controls_open != restore_controls_open:
@@ -1722,6 +2034,7 @@ class PianoAppController(QObject):
         self._show_stats = defaults.show_stats
         self._controls_open = defaults.controls_open
         self._settings_open = False
+        self._split_open = defaults.split_open
         self._transpose = defaults.transpose
         self._sustain_percent = defaults.sustain_percent
         self._sustain_fade = defaults.sustain_fade
@@ -1742,6 +2055,8 @@ class PianoAppController(QObject):
         self._window_y = defaults.window_y
         self._keyboard_input_mode = defaults.keyboard_input_mode
         self._keyboard_layout_choice_seen = defaults.keyboard_layout_choice_seen
+        self._split_zones = defaults.split_zones
+        self._pending_plugin_instrument_id = ""
         self._default_keybind_map_full = build_default_keybind_map_full(self._keyboard_input_mode)
         self._custom_keybind_overrides = {}
         self._keybind_committed_map_full = dict(self._default_keybind_map_full)
@@ -1868,6 +2183,9 @@ class PianoAppController(QObject):
         if self._tutorial_active or self._keybind_edit_active or self._keyboard_layout_prompt_active:
             return True
         if int(event.key()) in {int(Qt.Key.Key_Tab), int(Qt.Key.Key_Backtab)}:
+            return False
+        if QApplication.activePopupWidget() is not None:
+            # An open drop-down or key-range picker handles its own keys.
             return False
         focus = QApplication.focusWidget()
         return focus is None or focus is self.window or focus is self.window.piano_widget
@@ -2188,12 +2506,17 @@ class PianoAppController(QObject):
         return clamp_transposed_note(base_note, self._transpose, self._mode_min, self._mode_max)
 
     def _audio_note_on_safe(self, midi_note: int, velocity: int) -> None:
+        # A key inside a split zone plays that zone's sound instead of the main instrument.
+        if self._split_manager.note_on(midi_note, velocity):
+            return
         try:
             self.audio_engine.note_on(midi_note, velocity=velocity)
         except Exception as exc:
             self._report_audio_error(exc)
 
     def _audio_note_off_safe(self, midi_note: int) -> None:
+        if self._split_manager.note_off(midi_note):
+            return
         try:
             self.audio_engine.note_off(midi_note)
         except Exception as exc:
@@ -2201,14 +2524,18 @@ class PianoAppController(QObject):
 
     def _physical_key_release(self, midi_note: int, timestamp: float) -> None:
         try:
-            release = getattr(self.audio_engine, 'key_release', None)
-            if callable(release):
-                release(midi_note)
+            if not self._split_manager.key_release(midi_note):
+                release = getattr(self.audio_engine, 'key_release', None)
+                if callable(release):
+                    release(midi_note)
         except Exception as exc:
             self._report_audio_error(exc)
         self._recorder.add_key_release(midi_note, timestamp=timestamp)
 
     def _audio_all_notes_off_safe(self) -> None:
+        split_manager = getattr(self, '_split_manager', None)
+        if split_manager is not None:
+            split_manager.all_notes_off()
         if getattr(self, '_audio_handoff', False):
             return
         try:
@@ -2309,6 +2636,8 @@ class PianoAppController(QObject):
 
     def _activate_note(self, note: int, source: str, velocity: int = 100, *,
                        timestamp: float | None = None) -> None:
+        # While a zone's key-range picker is open, a played key also sets an end of the range.
+        self.window.feed_split_range_note(int(note))
         if getattr(self, '_audio_handoff', False):
             return
         if note not in self._note_sources:
@@ -2679,6 +3008,9 @@ class PianoAppController(QObject):
             keyboard_input_mode=self._keyboard_input_mode,
             keyboard_layout_choice_seen=self._keyboard_layout_choice_seen,
             custom_keybinds=serialize_custom_keybind_payload(self._custom_keybind_overrides),
+            split_zones=self._split_zones,
+            plugin_folders=self._plugin_folders,
+            split_open=self._tutorial_prev_split_open if self._tutorial_active else self._split_open,
         )
         try:
             save_settings(settings, self._settings_path)
@@ -3107,6 +3439,8 @@ class PianoAppController(QObject):
         self._recording_elapsed_seconds = 0
         self._safe_call(lambda: self.window.set_recording_elapsed(0))
         self._safe_call(self._stop_all_notes)
+        self._plugin_library.close()
+        self._split_manager.close()
         self._audio_session.close()
         self._safe_call(self.window.close_update_progress)
         self._safe_call(lambda: self.window.set_recording_save_busy(False))
@@ -3117,6 +3451,8 @@ class PianoAppController(QObject):
         self.window._update_install_confirm = self._confirm_update_recording
         self.window.show_at_position_or_centered(self._window_x, self._window_y)
         QTimer.singleShot(400, self._post_startup_prompts)
+        # Looks for new, changed and removed plug-ins without holding up the start.
+        QTimer.singleShot(600, self._plugin_library.rescan)
 
     def _maybe_warn_audio_unavailable(self) -> None:
         if self.audio_available or not self._audio_startup_error:
@@ -3133,4 +3469,9 @@ class PianoAppController(QObject):
         self._maybe_warn_audio_unavailable()
         if self._is_shutdown:
             return
+        if self._plugin_startup_notice:
+            notice, self._plugin_startup_notice = self._plugin_startup_notice, ""
+            self.window.show_warning("Plug-in Skipped", notice)
+            if self._is_shutdown:
+                return
         self._maybe_prompt_keyboard_input_mode()

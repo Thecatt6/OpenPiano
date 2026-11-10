@@ -10,8 +10,22 @@ if TYPE_CHECKING:
 
 
 def instrument_options(instruments: list[InstrumentInfo]) -> list[tuple[str, str]]:
-    source_labels = {"builtin": "OpenPiano Built-in", "localappdata": "OpenPiano External"}
-    return [(f"{item.name} [{source_labels[item.source]}]", item.id) for item in instruments]
+    source_labels = {"builtin": "OpenPiano Built-in", "localappdata": "OpenPiano External", "plugin": "VST3 Plug-in"}
+    return [(f"{item.name} [{source_labels.get(item.source, item.source)}]", item.id) for item in instruments]
+
+
+def zone_program_options(
+    programs: dict[int, list[int]], names: dict[int, dict[int, str]] | None = None,
+) -> list[tuple[str, tuple[int, int]]]:
+    labels = names or {}
+    several_banks = len(programs) > 1
+    options: list[tuple[str, tuple[int, int]]] = []
+    for bank in sorted(programs):
+        for preset in sorted(set(programs[bank])):
+            name = str(labels.get(bank, {}).get(preset, "")).strip()
+            number = f"{bank}:{preset}" if several_banks else str(preset)
+            options.append((f"{number} - {name}" if name else number, (int(bank), int(preset))))
+    return options
 
 
 def bank_options(banks: list[int], names: dict[int, str] | None = None) -> list[tuple[str, int]]:

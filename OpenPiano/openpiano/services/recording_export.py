@@ -26,6 +26,11 @@ def wav_export_args(
     preset: int,
     master_volume: float,
 ) -> dict[str, object]:
+    if instrument is not None and instrument.source == "plugin":
+        raise RuntimeError(
+            "WAV export renders SoundFonts only, so it is not available while a plug-in is the "
+            "main instrument.\n\nSave the recording as MIDI instead."
+        )
     if instrument is None or not instrument.path.exists():
         raise RuntimeError("WAV export requires a valid loaded SoundFont.")
     return {

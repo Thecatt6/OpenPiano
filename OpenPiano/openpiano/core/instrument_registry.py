@@ -17,13 +17,14 @@ from openpiano.core.config import (
 from openpiano.core.normalize import clamp_int
 from openpiano.core.runtime_paths import app_local_data_dir, project_root, resource_root
 
-InstrumentSource = Literal["builtin", "localappdata"]
+InstrumentSource = Literal["builtin", "localappdata", "plugin"]
 
 SOUNDFONTS_DIR_NAME = "soundfonts"
 SOUNDFONT_EXTENSIONS = (".sf2", ".sf3")
 SOURCE_ORDER: dict[InstrumentSource, int] = {
     "builtin": 0,
     "localappdata": 1,
+    "plugin": 2,
 }
 
 

@@ -38,7 +38,7 @@ class TutorialFlowService:
             {
                 "id": "footer",
                 "title": "Footer Actions",
-                "body": "The left icons change theme, pin the window, and toggle Settings, Controls, and Stats. Crimson icons indicate visible panels. Website, Tutorial, and Donate are on the right.",
+                "body": "The left icons change theme, pin the window, and toggle Settings, Controls, Keyboard Split, and Stats. Crimson icons indicate visible panels. Website, Tutorial, and Donate are on the right.",
                 "target": "footer",
             },
             {

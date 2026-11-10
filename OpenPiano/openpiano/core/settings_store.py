@@ -32,6 +32,7 @@ from openpiano.core.config import (
 from openpiano.core.keymap import MIDI_END_88, MIDI_START_88, PianoMode, binding_from_id, binding_to_id
 from openpiano.core.normalize import clamp_float, clamp_int
 from openpiano.core.audio_levels import normalize_volume
+from openpiano.core.split import SplitZone, default_split_zones, normalize_split_zones, split_zones_payload
 
 SETTINGS_FILE_NAME = "OpenPiano_config.json"
 ThemeMode = Literal["dark", "light"]
@@ -74,6 +75,9 @@ class AppSettings:
     keyboard_input_mode: KeyboardInputMode = "layout"
     keyboard_layout_choice_seen: bool = False
     custom_keybinds: dict[str, str] = field(default_factory=dict)
+    split_zones: tuple[SplitZone, ...] = field(default_factory=default_split_zones)
+    plugin_folders: tuple[str, ...] = ()
+    split_open: bool = False
 
 
 def _appdata_settings_dir() -> Path | None:
@@ -229,6 +233,17 @@ def _clamp_custom_keybinds(value: Any) -> dict[str, str]:
     return parsed
 
 
+def _clamp_plugin_folders(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    folders: list[str] = []
+    for item in value:
+        text = item.strip() if isinstance(item, str) else ""
+        if text and text not in folders:
+            folders.append(text)
+    return tuple(folders[:32])
+
+
 def load_settings(path: Path | None = None) -> AppSettings:
     file_path = _settings_path(path)
     if not file_path.exists():
@@ -275,6 +290,9 @@ def load_settings(path: Path | None = None) -> AppSettings:
     keyboard_input_mode = _clamp_keyboard_input_mode(payload.get("keyboard_input_mode"))
     keyboard_layout_choice_seen = _clamp_bool(payload.get("keyboard_layout_choice_seen"), False)
     custom_keybinds = _clamp_custom_keybinds(payload.get("custom_keybinds"))
+    split_zones = normalize_split_zones(payload.get("split_zones"))
+    plugin_folders = _clamp_plugin_folders(payload.get("plugin_folders"))
+    split_open = _clamp_bool(payload.get("split_open"), False)
     return AppSettings(
         mode=mode,
         instrument_id=instrument_id,
@@ -305,6 +323,9 @@ def load_settings(path: Path | None = None) -> AppSettings:
         keyboard_input_mode=keyboard_input_mode,
         keyboard_layout_choice_seen=keyboard_layout_choice_seen,
         custom_keybinds=custom_keybinds,
+        split_zones=split_zones,
+        plugin_folders=plugin_folders,
+        split_open=split_open,
     )
 
 
@@ -344,6 +365,9 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
         "keyboard_input_mode": _clamp_keyboard_input_mode(settings.keyboard_input_mode),
         "keyboard_layout_choice_seen": _clamp_bool(settings.keyboard_layout_choice_seen, False),
         "custom_keybinds": _clamp_custom_keybinds(settings.custom_keybinds),
+        "split_zones": split_zones_payload(settings.split_zones),
+        "plugin_folders": list(_clamp_plugin_folders(settings.plugin_folders)),
+        "split_open": _clamp_bool(settings.split_open, False),
     }
     raw = json.dumps(payload, indent=2)
 
