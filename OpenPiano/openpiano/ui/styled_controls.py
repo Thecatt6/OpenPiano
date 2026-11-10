@@ -299,6 +299,7 @@ class ChevronComboBox(QComboBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._loading = False
+        self._elide_current_text = False
         self._description_before_loading = ''
         self._arrow_idle = QColor("#B7B7BC")
         self._arrow_active = QColor("#F4F4F5")
@@ -320,6 +321,31 @@ class ChevronComboBox(QComboBox):
         self._arrow_idle = QColor(idle)
         self._arrow_active = QColor(active)
         self.update()
+
+    def set_elide_current_text(self, elide: bool) -> None:
+        """Ends a text that does not fit with an ellipsis; by default it is cut off."""
+        self._elide_current_text = bool(elide)
+        self.update()
+
+    def _paint_elided(self) -> bool:
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        text = option.currentText
+        if self.currentIndex() < 0 and self.placeholderText():
+            # As Qt paints it: the placeholder, in the placeholder colour.
+            text = self.placeholderText()
+            option.palette.setBrush(QPalette.ButtonText, option.palette.placeholderText())
+        if not text:
+            return False
+        field = self.style().subControlRect(QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxEditField, self)
+        if not field.isValid() or option.fontMetrics.horizontalAdvance(text) <= field.width():
+            return False
+        option.currentText = option.fontMetrics.elidedText(text, Qt.TextElideMode.ElideRight, field.width())
+        painter = QStylePainter(self)
+        painter.drawComplexControl(QStyle.CC_ComboBox, option)
+        painter.drawControl(QStyle.CE_ComboBoxLabel, option)
+        painter.end()
+        return True
 
     def set_loading(self, loading: bool) -> None:
         loading = bool(loading)
@@ -359,7 +385,7 @@ class ChevronComboBox(QComboBox):
                 Qt.AlignVCenter | Qt.AlignLeading, loading_option.palette,
                 self.isEnabled(), 'Loading...', QPalette.ButtonText)
             loading_painter.end()
-        else:
+        elif not (self._elide_current_text and self._paint_elided()):
             super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)

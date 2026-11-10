@@ -167,6 +167,7 @@ class PianoAppController(QObject):
         self._show_stats = bool(settings.show_stats)
         self._controls_open = bool(settings.controls_open)
         self._settings_open = False
+        self._split_open = bool(settings.split_open)
         self._transpose = int(settings.transpose)
         self._sustain_percent = int(settings.sustain_percent)
         self._sustain_fade = max(0, min(100, int(settings.sustain_fade)))
@@ -250,6 +251,7 @@ class PianoAppController(QObject):
         self._tutorial_index = 0
         self._tutorial_prev_settings_open = False
         self._tutorial_prev_controls_open = False
+        self._tutorial_prev_split_open = False
         self._tutorial_prev_stats_visible = self._show_stats
         self._tutorial_prev_mode: PianoMode = self._mode
         self._tutorial_flow = TutorialFlowService()
@@ -411,6 +413,7 @@ class PianoAppController(QObject):
         self.window.checkUpdatesNowRequested.connect(lambda: self._trigger_update_check(manual=True))
         self.window.settingsToggled.connect(self._on_settings_toggled)
         self.window.controlsToggled.connect(self._on_controls_toggled)
+        self.window.splitToggled.connect(self._on_split_toggled)
         self.window.statsToggled.connect(self._on_stats_toggled)
         self.window.midiInputDeviceChanged.connect(self._on_midi_input_device_changed)
         self.window.midiInputDropdownOpened.connect(self._on_midi_input_dropdown_opened)
@@ -454,7 +457,7 @@ class PianoAppController(QObject):
         self.window.set_animation_speed(self._animation_speed)
         self.window.set_auto_check_updates(self._auto_check_updates)
         self.window.set_stats_visible(self._show_stats)
-        self.window.set_settings_visible(self._settings_open)
+        self._apply_tall_panels()
         self.window.set_controls_visible(self._controls_open)
         self.window.set_recording_state(active=False, has_take=False)
         self.window.set_key_color("white_key", self._white_key_color)
@@ -1643,11 +1646,37 @@ class PianoAppController(QObject):
         self.window.set_theme_mode(self._theme_mode)
         self._refresh_stats_ui()
 
+    def _apply_tall_panels(self) -> None:
+        self.window.set_split_visible(self._split_open)
+        self.window.set_settings_visible(self._settings_open)
+
+    def _show_settings_panel(self, visible: bool) -> None:
+        # Settings and Keyboard Split take each other's place in the window, which keeps it
+        # from growing past the screen when both are wanted.
+        self._settings_open = bool(visible)
+        if self._settings_open:
+            self._split_open = False
+        self._apply_tall_panels()
+
+    def _show_split_panel(self, visible: bool) -> None:
+        self._split_open = bool(visible)
+        if self._split_open:
+            self._settings_open = False
+        self._apply_tall_panels()
+
     def _on_settings_toggled(self, visible: bool) -> None:
         if self._tutorial_active:
             return
-        self._settings_open = bool(visible)
-        self.window.set_settings_visible(self._settings_open)
+        split_was_open = self._split_open
+        self._show_settings_panel(visible)
+        if self._split_open != split_was_open:
+            self._schedule_persist()
+
+    def _on_split_toggled(self, visible: bool) -> None:
+        if self._tutorial_active:
+            return
+        self._show_split_panel(visible)
+        self._schedule_persist()
 
     def _on_controls_toggled(self, visible: bool) -> None:
         if self._tutorial_active:
@@ -1813,6 +1842,7 @@ class PianoAppController(QObject):
         self._sync_tutorial_state_from_service()
         self._tutorial_prev_settings_open = self._settings_open
         self._tutorial_prev_controls_open = self._controls_open
+        self._tutorial_prev_split_open = self._split_open
         self._tutorial_prev_stats_visible = self._show_stats
         self._tutorial_prev_mode = self._mode
         self._stop_all_notes()
@@ -1827,8 +1857,7 @@ class PianoAppController(QObject):
             if step is None:
                 break
             if bool(step.get("open_settings")) and not self._settings_open:
-                self._settings_open = True
-                self.window.set_settings_visible(True)
+                self._show_settings_panel(True)
             if bool(step.get("open_controls")) and not self._controls_open:
                 self._controls_open = True
                 self.window.set_controls_visible(True)
@@ -1897,10 +1926,10 @@ class PianoAppController(QObject):
         self._sync_tutorial_state_from_service()
         self.window.set_tutorial_mode(False)
 
-        restore_settings_open = bool(self._tutorial_prev_settings_open)
-        if self._settings_open != restore_settings_open:
-            self._settings_open = restore_settings_open
-            self.window.set_settings_visible(self._settings_open)
+        restore_tall_panels = (bool(self._tutorial_prev_settings_open), bool(self._tutorial_prev_split_open))
+        if (self._settings_open, self._split_open) != restore_tall_panels:
+            self._settings_open, self._split_open = restore_tall_panels
+            self._apply_tall_panels()
 
         restore_controls_open = bool(self._tutorial_prev_controls_open)
         if self._controls_open != restore_controls_open:
@@ -1951,6 +1980,7 @@ class PianoAppController(QObject):
         self._show_stats = defaults.show_stats
         self._controls_open = defaults.controls_open
         self._settings_open = False
+        self._split_open = defaults.split_open
         self._transpose = defaults.transpose
         self._sustain_percent = defaults.sustain_percent
         self._sustain_fade = defaults.sustain_fade
@@ -2926,6 +2956,7 @@ class PianoAppController(QObject):
             custom_keybinds=serialize_custom_keybind_payload(self._custom_keybind_overrides),
             split_zones=self._split_zones,
             plugin_folders=self._plugin_folders,
+            split_open=self._tutorial_prev_split_open if self._tutorial_active else self._split_open,
         )
         try:
             save_settings(settings, self._settings_path)

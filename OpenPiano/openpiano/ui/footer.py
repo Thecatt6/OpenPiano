@@ -69,6 +69,13 @@ def build_footer_icon(name: str, color: str, size: int, *, checked_color: str | 
                 painter.drawLine(QPointF(3, y), QPointF(21, y))
                 painter.setBrush(QColor(ink))
                 painter.drawEllipse(QPointF(knob_x, y), 2.3, 2.3)
+        elif name == "split":
+            # A short keyboard whose lowest keys form a zone of their own.
+            painter.drawRoundedRect(QRectF(3, 5, 18, 14), 2, 2)
+            painter.drawLine(QPointF(15, 5), QPointF(15, 19))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(ink))
+            painter.drawRect(QRectF(3.6, 5.6, 5.9, 12.8))
         elif name == "stats":
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(ink))

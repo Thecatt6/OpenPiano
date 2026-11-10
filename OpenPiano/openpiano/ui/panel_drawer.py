@@ -7,10 +7,14 @@ ActivePanel = Literal["none", "settings", "controls", "both"]
 
 
 class PanelDrawerState:
+    """Which drawers are open. Settings and Keyboard Split are the two tall drawers and share
+    one place in the window, so opening either closes the other."""
+
     def __init__(self, active: ActivePanel = "none") -> None:
         normalized = self._normalize(active)
         self._settings_visible = normalized in {"settings", "both"}
         self._controls_visible = normalized in {"controls", "both"}
+        self._split_visible = False
 
     @staticmethod
     def _normalize(value: str) -> ActivePanel:
@@ -40,11 +44,26 @@ class PanelDrawerState:
     def controls_visible(self) -> bool:
         return self._controls_visible
 
+    @property
+    def split_visible(self) -> bool:
+        return self._split_visible
+
     def set_settings_visible(self, visible: bool) -> bool:
         target = bool(visible)
         if target == self._settings_visible:
             return False
         self._settings_visible = target
+        if target:
+            self._split_visible = False
+        return True
+
+    def set_split_visible(self, visible: bool) -> bool:
+        target = bool(visible)
+        if target == self._split_visible:
+            return False
+        self._split_visible = target
+        if target:
+            self._settings_visible = False
         return True
 
     def set_controls_visible(self, visible: bool) -> bool:

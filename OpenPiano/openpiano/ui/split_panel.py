@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Callable, Sequence
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -60,13 +61,58 @@ def _fill_combo(combo: ChevronComboBox, options: list[tuple[str, object]], selec
     combo.blockSignals(blocked)
 
 
+class ElidedLabel(QLabel):
+    """One line of text that is shortened with an ellipsis when there is no room for it, and
+    never asks the layout for room. The full text is then offered as the tooltip."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self._tooltip = ""
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+
+    def full_text(self) -> str:
+        return self._full_text
+
+    def set_full_text(self, text: str, tooltip: str = "") -> None:
+        self._full_text = str(text or "")
+        self._tooltip = str(tooltip or "")
+        self._refresh()
+
+    def _refresh(self) -> None:
+        shown = self.fontMetrics().elidedText(self._full_text, Qt.ElideRight, max(0, self.contentsRect().width()))
+        if shown != self.text():
+            self.setText(shown)
+        self.setToolTip(self._tooltip or (self._full_text if shown != self._full_text else ""))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange):
+            self._refresh()
+
+
+# Narrowest the two lists of a zone may get, in letters, and the widest their pop-ups may get.
+_SOUND_MIN_LETTERS = 11
+_PRESET_MIN_LETTERS = 9
+_POPUP_MAX_WIDTH = 460
+
+# Columns of the zone table.
+(_COLUMN_SWATCH, _COLUMN_ZONE, _COLUMN_KEYS, _COLUMN_SOUND, _COLUMN_PRESET, _COLUMN_OCTAVE,
+ _COLUMN_VOLUME, _COLUMN_VOLUME_VALUE) = range(8)
+
+
 class SplitZoneControls(QObject):
-    """The two rows of controls that describe one split zone."""
+    """The row of controls that describes one split zone."""
 
     changed = Signal(int, object)
     editorRequested = Signal(int)
 
-    def __init__(self, index: int, card: QWidget, card_layout: QVBoxLayout, scale: ScaleFunc,
+    def __init__(self, index: int, card: QWidget, grid: QGridLayout, row: int, scale: ScaleFunc,
                  theme: ThemeProvider) -> None:
         super().__init__(card)
         self.index = index
@@ -84,37 +130,19 @@ class SplitZoneControls(QObject):
         color = SPLIT_ZONE_COLORS[index % len(SPLIT_ZONE_COLORS)]
         self._color = color
 
-        range_row = QHBoxLayout()
+        # Created left to right, which is also the order Tab moves through them.
         self.swatch = QFrame(card)
         self.swatch.setObjectName("splitSwatch")
         self.swatch.setStyleSheet(f"#splitSwatch {{ background: {color}; border-radius: 3px; }}")
         self.swatch.setToolTip("Colour of this zone's marker above the keys.")
         self.enable_checkbox = QCheckBox(f"Zone {index + 1}", card)
         self.enable_checkbox.setObjectName("settingCheckbox")
+        self.enable_checkbox.setToolTip(f"Switch zone {index + 1} on or off.")
         self.enable_checkbox.toggled.connect(lambda checked: self._emit(enabled=bool(checked)))
         self.range_button = KeyRangeButton(scale, card)
         self.range_button.setAccessibleName(f"Zone {index + 1} key range")
         self.range_button.setToolTip(f"Choose the keys of zone {index + 1} on a picture of the keyboard.")
         self.range_button.clicked.connect(self.open_range_picker)
-        self.octave_combo = ChevronComboBox(card)
-        self.octave_combo.setObjectName("splitCombo")
-        self.octave_combo.setAccessibleName(f"Zone {index + 1} octave shift")
-        self.octave_combo.setToolTip("Octave shift applied to this zone only.")
-        for octave in range(SPLIT_OCTAVE_MIN, SPLIT_OCTAVE_MAX + 1):
-            self.octave_combo.addItem("Octave 0" if octave == 0 else f"Octave {octave:+d}", userData=octave)
-        self.octave_combo.currentIndexChanged.connect(lambda _index: self._emit_combo(self.octave_combo, "octave"))
-        self.status_label = QLabel("", card)
-        self.status_label.setObjectName("settingHint")
-        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.status_label.setMinimumWidth(0)
-        range_row.addWidget(self.swatch)
-        range_row.addWidget(self.enable_checkbox)
-        range_row.addWidget(self.range_button)
-        range_row.addWidget(self.octave_combo)
-        range_row.addWidget(self.status_label, 1)
-        card_layout.addLayout(range_row)
-
-        sound_row = QHBoxLayout()
         self.instrument_combo = ChevronComboBox(card)
         self.instrument_combo.setObjectName("splitCombo")
         self.instrument_combo.setAccessibleName(f"Zone {index + 1} sound")
@@ -125,6 +153,21 @@ class SplitZoneControls(QObject):
         self.program_combo.setAccessibleName(f"Zone {index + 1} preset")
         self.program_combo.setToolTip("Preset of this zone's SoundFont.")
         self.program_combo.currentIndexChanged.connect(self._on_program_index_changed)
+        self.editor_button = QPushButton("Plug-in Window", card)
+        self.editor_button.setObjectName("actionButton")
+        self.editor_button.setToolTip("Open this zone's plug-in window, where the plug-in's sounds are chosen.")
+        self.editor_button.clicked.connect(lambda: self.editorRequested.emit(self.index))
+        self.editor_button.setVisible(False)
+        self.status_label = ElidedLabel(card)
+        self.status_label.setObjectName("settingHint")
+        self.status_label.setVisible(False)
+        self.octave_combo = ChevronComboBox(card)
+        self.octave_combo.setObjectName("splitCombo")
+        self.octave_combo.setAccessibleName(f"Zone {index + 1} octave shift")
+        self.octave_combo.setToolTip("Octave shift applied to this zone only.")
+        for octave in range(SPLIT_OCTAVE_MIN, SPLIT_OCTAVE_MAX + 1):
+            self.octave_combo.addItem("Octave 0" if octave == 0 else f"Octave {octave:+d}", userData=octave)
+        self.octave_combo.currentIndexChanged.connect(lambda _index: self._emit_combo(self.octave_combo, "octave"))
         self.volume_slider = QSlider(Qt.Horizontal, card)
         self.volume_slider.setObjectName("splitVolumeSlider")
         self.volume_slider.setAccessibleName(f"Zone {index + 1} volume")
@@ -134,22 +177,28 @@ class SplitZoneControls(QObject):
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
         self.volume_value = QLabel("100%", card)
         self.volume_value.setObjectName("settingValue")
-        self.editor_button = QPushButton("Plug-in Window", card)
-        self.editor_button.setObjectName("actionButton")
-        self.editor_button.setToolTip("Open this zone's plug-in window.")
-        self.editor_button.clicked.connect(lambda: self.editorRequested.emit(self.index))
-        self.editor_button.setVisible(False)
-        sound_row.addWidget(self.instrument_combo, 3)
-        sound_row.addWidget(self.program_combo, 2)
-        sound_row.addWidget(self.volume_slider, 2)
-        sound_row.addWidget(self.volume_value)
-        sound_row.addWidget(self.editor_button)
-        self._sound_row = sound_row
-        card_layout.addLayout(sound_row)
-        for combo in (self.octave_combo, self.instrument_combo, self.program_combo):
-            combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.instrument_combo.setMinimumContentsLength(12)
-        self.program_combo.setMinimumContentsLength(8)
+        self.volume_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        grid.addWidget(self.swatch, row, _COLUMN_SWATCH, Qt.AlignVCenter)
+        grid.addWidget(self.enable_checkbox, row, _COLUMN_ZONE)
+        grid.addWidget(self.range_button, row, _COLUMN_KEYS)
+        grid.addWidget(self.instrument_combo, row, _COLUMN_SOUND)
+        # One place, three occupants: the preset list of a SoundFont, the window button of a
+        # plug-in, or a message while the sound is loading or could not be loaded.
+        grid.addWidget(self.program_combo, row, _COLUMN_PRESET)
+        grid.addWidget(self.editor_button, row, _COLUMN_PRESET)
+        grid.addWidget(self.status_label, row, _COLUMN_PRESET)
+        grid.addWidget(self.octave_combo, row, _COLUMN_OCTAVE)
+        grid.addWidget(self.volume_slider, row, _COLUMN_VOLUME)
+        grid.addWidget(self.volume_value, row, _COLUMN_VOLUME_VALUE)
+        self.octave_combo.setSizeAdjustPolicy(
+            ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        for combo in (self.instrument_combo, self.program_combo):
+            # Their share of the row is set by the table, not by the length of their names;
+            # the list that drops down is made wide enough to read instead.
+            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            combo.set_elide_current_text(True)
+            combo.popupAboutToShow.connect(lambda combo=combo: self._fit_popup_to_names(combo))
         self.instrument_combo.setPlaceholderText("Choose a sound")
         self.program_combo.setPlaceholderText("Preset")
         self.refresh_metrics()
@@ -160,7 +209,11 @@ class SplitZoneControls(QObject):
         self.swatch.setFixedSize(swatch, swatch)
         self._refresh_range_button()
         self.octave_combo.setMinimumWidth(self._combo_width(self.octave_combo, "Octave +3"))
-        self.volume_slider.setMinimumWidth(self._scale(90))
+        self.instrument_combo.setMinimumWidth(self._combo_width(self.instrument_combo, "n" * _SOUND_MIN_LETTERS))
+        self.program_combo.setMinimumWidth(self._combo_width(self.program_combo, "n" * _PRESET_MIN_LETTERS))
+        # (The width of the value next to it comes from the style sheet, like every other
+        # value label; a width set here would be replaced whenever the style is re-applied.)
+        self.volume_slider.setMinimumWidth(self._scale(72))
 
     def _combo_width(self, combo: ChevronComboBox, widest_text: str) -> int:
         # The style sheet's padding and drop-down button take a share of the width that
@@ -170,6 +223,20 @@ class SplitZoneControls(QObject):
         field = combo.style().subControlRect(QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxEditField, combo)
         chrome = option.rect.width() - field.width() if field.isValid() else self._scale(70)
         return combo.fontMetrics().horizontalAdvance(widest_text) + max(0, chrome) + self._scale(8)
+
+    def _fit_popup_to_names(self, combo: ChevronComboBox) -> None:
+        """Widens the list that drops down so that its names can be read in full, however
+        narrow the combo box itself is."""
+        view = combo.view()
+        if view is None or combo.count() <= 0:
+            return
+        metrics = view.fontMetrics()
+        widest = max(metrics.horizontalAdvance(combo.itemText(index)) for index in range(combo.count()))
+        scroll_bar = view.style().pixelMetric(QStyle.PM_ScrollBarExtent, None, view)
+        # Room for the selection marker, the margins of a row and the scroll bar; bold text
+        # runs a little wider than the regular font measured here.
+        wanted = round(widest * 1.08) + self._scale(30) + scroll_bar
+        view.setMinimumWidth(max(combo.width(), min(wanted, self._scale(_POPUP_MAX_WIDTH))))
 
     def _refresh_range_button(self) -> None:
         self.range_button.show_range(self._low, self._high, self._color, self._theme())
@@ -265,16 +332,14 @@ class SplitZoneControls(QObject):
                   is_plugin: bool = False) -> None:
         self._ready = status == "ready"
         text = {"loading": "Loading…", "error": error or "Could not load this sound."}.get(status, "")
-        self.status_label.setText(text)
-        self.status_label.setToolTip(text if status == "error" else "")
+        self.status_label.set_full_text(text, text if status == "error" else "")
         options = zone_program_options(programs or {}, program_names) if self._ready else []
         _fill_combo(self.program_combo, options, (int(bank), int(preset)))
         # A plug-in chooses its sounds in its own window, so it gets that button instead.
         plugin_ready = self._ready and is_plugin
-        self.program_combo.setVisible(not plugin_ready)
-        self.editor_button.setVisible(plugin_ready)
-        # The plug-in's name takes over the room the preset list would have used.
-        self._sound_row.setStretchFactor(self.instrument_combo, 5 if plugin_ready else 3)
+        self.status_label.setVisible(bool(text))
+        self.program_combo.setVisible(not text and not plugin_ready)
+        self.editor_button.setVisible(not text and plugin_ready)
         self._refresh_enabled()
 
 
@@ -287,22 +352,34 @@ def other_zone_ranges(zones: Sequence[SplitZone], index: int) -> list[OtherRange
     ]
 
 
+SPLIT_HINT = ("Each zone plays its own sound on its keys; every other key plays the main instrument. "
+              "Where zones overlap, the lowest-numbered zone plays.")
+
+
+def configure_split_grid(grid: QGridLayout, scale: ScaleFunc) -> None:
+    grid.setContentsMargins(6, scale(2), 6, scale(2))
+    grid.setHorizontalSpacing(scale(8))
+    grid.setVerticalSpacing(scale(6))
+
+
 def create_split_card(
     card: QFrame, card_layout: QVBoxLayout, scale: ScaleFunc, zone_count: int, theme: ThemeProvider,
-) -> tuple[list[SplitZoneControls], QLabel]:
-    zones = [SplitZoneControls(index, card, card_layout, scale, theme) for index in range(zone_count)]
+) -> tuple[list[SplitZoneControls], QLabel, QGridLayout]:
+    """Fills the Keyboard Split card: one row per zone, then a line that explains the zones."""
+    grid = QGridLayout()
+    configure_split_grid(grid, scale)
+    grid.setColumnStretch(_COLUMN_SOUND, 4)
+    grid.setColumnStretch(_COLUMN_PRESET, 3)
+    grid.setColumnStretch(_COLUMN_VOLUME, 2)
+    zones = [SplitZoneControls(index, card, grid, index, scale, theme) for index in range(zone_count)]
+    card_layout.addLayout(grid)
     hint_row = QHBoxLayout()
-    hint = QLabel(
-        "Each zone plays its own sound over a range of keys; every other key keeps the main "
-        "instrument. Click a zone's keys to choose its range on the keyboard. Where zones "
-        "overlap, the lowest-numbered zone plays.",
-        card,
-    )
+    hint = ElidedLabel(card)
     hint.setObjectName("settingHint")
-    hint.setWordWrap(True)
+    hint.set_full_text(SPLIT_HINT)
     hint_row.addWidget(hint, 1)
     card_layout.addLayout(hint_row)
-    return zones, hint
+    return zones, hint, grid
 
 
 class PluginCardControls(QObject):

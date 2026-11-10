@@ -82,13 +82,13 @@ The computer keyboard and mouse use the note strength set under **Settings > Sou
 
 OpenPiano includes Default and Grand Piano SoundFonts, listed as **OpenPiano Built-in**. A SoundFont is an instrument sound file. For another piano sound, use **Settings > Download Hi-Fi D-274 Piano (~400 MB)**. The optional Steinway D-274 download is listed as **OpenPiano External**. You can also add compatible SF2 or SF3 files to `%LOCALAPPDATA%\OpenPiano\soundfonts`, then restart the app.
 
-Use **Controls** to select the instrument, bank and preset. Adjust volume, note strength, sustain and pitch in **Settings > Sound**.
+Use **Controls** to select the instrument. A SoundFont file holds many sounds: **Bank** is the group of sounds inside the file and **Preset** is the sound itself. Adjust volume, note strength, sustain and pitch in **Settings > Sound**.
 
 ### Play VST3 instrument plug-ins
 
 OpenPiano looks for VST3 instrument plug-ins each time it starts and adds the ones it finds to the instrument list in **Controls**, marked **VST3 Plug-in**. It searches the standard Windows locations (`C:\Program Files\Common Files\VST3` and `%LOCALAPPDATA%\Programs\Common\VST3`) and `%LOCALAPPDATA%\OpenPiano\plugins`. Add more locations with **Settings > Plug-ins (VST3) > Plug-in Folders…**, and use **Rescan Plug-ins** after installing a new plug-in while OpenPiano is open.
 
-Select a plug-in like any other instrument. Its sounds are chosen in the plug-in's own window, opened with **Open Plug-in Window**, so the bank and preset lists stay empty. OpenPiano remembers what you set there for the next session.
+Select a plug-in like any other instrument. Plug-ins do not use banks and presets, so while one is selected those two lists are replaced by the **Open Plug-in Window** button: the sounds are chosen in the plug-in's own window. OpenPiano remembers what you set there for the next session.
 
 Each plug-in is checked in a separate helper process, so a plug-in that crashes or hangs while being checked is left out of the list instead of closing OpenPiano. If OpenPiano closes unexpectedly while it is loading a plug-in, it starts with a built-in sound the next time and tells you which plug-in was skipped.
 
@@ -98,7 +98,7 @@ Only VST3 instruments are supported. Effect plug-ins and the VST2, CLAP and AU f
 
 ### Split the keyboard
 
-Use **Settings > Keyboard Split** to give a range of keys its own sound, for example a bass in the left hand and a piano in the right. Tick **Zone 1**, **Zone 2** or **Zone 3**, click the zone's key range to open a picture of the keyboard, and drag across the keys the zone should cover. A single click moves the nearer end of the range, and with a MIDI keyboard connected you can simply play the lowest and the highest key. The arrow keys move the top of the range, Shift with the arrow keys moves the bottom, and Esc or Enter closes the picture. Then pick the sound for that range: any SoundFont with its preset, or a VST3 plug-in. Each zone has its own volume, relative to the main volume, and an octave shift. Keys outside every zone keep playing the main instrument.
+Click the **Keyboard Split** button in the bottom bar, next to Controls and Settings, to open its own panel and give a range of keys its own sound, for example a bass in the left hand and a piano in the right. The panel takes the place of Settings while it is open, so the window stays small enough for any screen; Controls can stay open next to it. Tick **Zone 1**, **Zone 2** or **Zone 3**, click the zone's key range to open a picture of the keyboard, and drag across the keys the zone should cover. A single click moves the nearer end of the range, and with a MIDI keyboard connected you can simply play the lowest and the highest key. The arrow keys move the top of the range, Shift with the arrow keys moves the bottom, and Esc or Enter closes the picture. Then pick the sound for that range: any SoundFont with its preset, or a VST3 plug-in. Each zone has its own volume, relative to the main volume, and an octave shift. Keys outside every zone keep playing the main instrument.
 
 A coloured strip above the keys shows where each zone lies. Zones do not layer: where two overlap, the lower-numbered zone plays. A zone applies to the note that sounds, the one that lights up on the piano, so transposing can move a key into or out of a zone.
 

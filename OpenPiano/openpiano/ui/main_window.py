@@ -53,6 +53,7 @@ from openpiano.core.config import (
 from openpiano.core.keymap import current_layout_demo_rows, qwerty_demo_rows
 from openpiano.core.audio_levels import normalize_volume
 from openpiano.core.object_tree import is_descendant_of
+from openpiano.core.plugin_registry import is_plugin_instrument_id
 from openpiano.core.preset_families import FamilyPreset, default_family_catalog, default_preset_family
 from openpiano.core.split import MAX_SPLIT_ZONES
 from openpiano.core.theme import ThemePalette
@@ -75,7 +76,13 @@ from openpiano.ui.panel_sections import (
 )
 from openpiano.ui.piano_widget import PianoWidget
 from openpiano.ui.plugin_folders_dialog import PluginDetailsDialog, PluginFoldersDialog
-from openpiano.ui.split_panel import PluginCardControls, create_split_card, other_zone_ranges
+from openpiano.ui.split_panel import (
+    ElidedLabel,
+    PluginCardControls,
+    configure_split_grid,
+    create_split_card,
+    other_zone_ranges,
+)
 from openpiano.ui.spotlight_overlay import SpotlightOverlay
 from openpiano.ui.stats_bar import StatsBar
 from openpiano.ui.styled_controls import ChevronComboBox, RoundHandleSliderStyle, SquareCheckBoxStyle
@@ -105,6 +112,11 @@ PIANO_STYLE_LABELS = {
 }
 
 FOOTER_ICON_SIZE = 18
+# Height of the Keyboard Split drawer before its contents have been measured.
+SPLIT_PANEL_HEIGHT_GUESS = 170
+PLUGIN_SOUND_HINT = "Choose the sound in the plug-in's own window."
+PLUGIN_SOUND_TOOLTIP = ("Bank and Preset pick a sound inside a SoundFont. A plug-in has no such lists: "
+                        "its sounds are chosen in its own window.")
 
 
 class MainWindow(QMainWindow):
@@ -136,6 +148,7 @@ class MainWindow(QMainWindow):
     checkUpdatesNowRequested = Signal()
     settingsToggled = Signal(bool)
     controlsToggled = Signal(bool)
+    splitToggled = Signal(bool)
     statsToggled = Signal(bool)
     midiInputDeviceChanged = Signal(str)
     midiInputDropdownOpened = Signal()
@@ -173,6 +186,10 @@ class MainWindow(QMainWindow):
         self._layout_transition_id = 0
         self._settings_visible = False
         self._controls_visible = False
+        self._split_visible = False
+        self._plugin_sound_mode = False
+        self._plugin_editor_available = False
+        self._audio_loading = False
         self._family_browsing = False
         self._family_entries: list[FamilyPreset] = []
         self._family_instrument_id = ""
@@ -253,6 +270,18 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.controls_scroll)
 
         self._build_controls_panel()
+
+        self.split_scroll = QScrollArea(root)
+        self.split_scroll.setObjectName("splitScroll")
+        self.split_scroll.setWidgetResizable(True)
+        self.split_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.split_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.split_scroll.setFrameShape(QFrame.NoFrame)
+        self.split_scroll.setVisible(False)
+        self.split_scroll.setFixedHeight(self._sp(SPLIT_PANEL_HEIGHT_GUESS))
+        outer.addWidget(self.split_scroll)
+
+        self._build_split_panel()
 
         self.panel_divider = QFrame(root)
         self.panel_divider.setObjectName("panelDivider")
@@ -448,15 +477,6 @@ class MainWindow(QMainWindow):
         keybind_hint_row.addWidget(self.keybind_hint_label, 1)
         keyboard_layout.addLayout(keybind_hint_row)
 
-        self.split_card, split_layout = self._create_section_card("Keyboard Split", self.settings_body)
-        layout.addWidget(self.split_card)
-        self.split_zone_controls, self.split_hint_label = create_split_card(
-            self.split_card, split_layout, self._sp, MAX_SPLIT_ZONES, lambda: self.theme,
-        )
-        for zone_controls in self.split_zone_controls:
-            zone_controls.changed.connect(self.splitZoneChanged.emit)
-            zone_controls.editorRequested.connect(self.pluginEditorRequested.emit)
-
         self.plugin_card, plugin_layout = self._create_section_card("Plug-ins (VST3)", self.settings_body)
         layout.addWidget(self.plugin_card)
         self.plugin_controls = PluginCardControls(self.plugin_card, plugin_layout)
@@ -600,6 +620,48 @@ class MainWindow(QMainWindow):
         )
         self.piano_download_button.setAccessibleDescription(status)
 
+    def _build_split_panel(self) -> None:
+        self.split_body = QWidget(self.split_scroll)
+        self.split_body.setObjectName("splitBody")
+        self.split_scroll.setWidget(self.split_body)
+
+        layout = QVBoxLayout(self.split_body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.split_card, split_layout = self._create_section_card("Keyboard Split", self.split_body)
+        layout.addWidget(self.split_card)
+        self.split_zone_controls, self.split_hint_label, self.split_grid = create_split_card(
+            self.split_card, split_layout, self._sp, MAX_SPLIT_ZONES, lambda: self.theme,
+        )
+        for zone_controls in self.split_zone_controls:
+            zone_controls.changed.connect(self.splitZoneChanged.emit)
+            zone_controls.editorRequested.connect(self.pluginEditorRequested.emit)
+
+    def _split_panel_height(self) -> int:
+        """The height at which the Keyboard Split drawer shows all of its rows."""
+        layout = self.split_body.layout()
+        if layout is not None:
+            layout.activate()
+        # The effects piano style draws a border around the drawer, and Qt keeps that frame
+        # once it has been there, so it is always counted.
+        return max(1, self.split_body.sizeHint().height()) + 2 * self.split_scroll.frameWidth()
+
+    def _split_panel_width(self) -> int:
+        """The narrowest the Keyboard Split drawer can be without cutting its rows."""
+        return self.split_body.minimumSizeHint().width() + 2 * self.split_scroll.frameWidth()
+
+    def _sync_split_panel_height(self) -> None:
+        if not self._split_visible:
+            return
+        if self._effects_layout_active:
+            # Floating over the piano, it is sized together with the other floating panels.
+            self.split_scroll.setMinimumHeight(0)
+            self.split_scroll.setMaximumHeight(16777215)  # Qt's QWIDGETSIZE_MAX: no limit
+            return
+        # Measured, not fixed: its rows follow the font, which differs between systems.
+        self.split_scroll.setFixedHeight(self._split_panel_height())
+
     def _build_controls_panel(self) -> None:
         self.controls_body = QWidget(self.controls_scroll)
         self.controls_body.setObjectName("controlsBody")
@@ -630,13 +692,16 @@ class MainWindow(QMainWindow):
         instrument_label.setObjectName("settingLabel")
         self.instrument_combo = ChevronComboBox(self.controls_card)
         self.instrument_combo.setObjectName("instrumentCombo")
+        self.instrument_combo.set_elide_current_text(True)
         self.instrument_combo.currentIndexChanged.connect(self._on_instrument_index_changed)
 
         bank_label = QLabel("Bank", self.controls_card)
         bank_label.setObjectName("settingLabel")
+        bank_label.setToolTip("A SoundFont keeps its sounds in groups called banks.")
         self.bank_label = bank_label
         self.bank_combo = ChevronComboBox(self.controls_card)
         self.bank_combo.setObjectName("bankCombo")
+        self.bank_combo.setToolTip("Group of sounds inside the selected SoundFont.")
         self.bank_combo.currentIndexChanged.connect(self._on_bank_index_changed)
         self.family_combo = ChevronComboBox(self.controls_card)
         self.family_combo.setObjectName("familyCombo")
@@ -647,9 +712,30 @@ class MainWindow(QMainWindow):
 
         preset_label = QLabel("Preset", self.controls_card)
         preset_label.setObjectName("settingLabel")
+        preset_label.setToolTip("The sound that is played, chosen from the selected bank.")
+        self.preset_label = preset_label
         self.preset_combo = ChevronComboBox(self.controls_card)
         self.preset_combo.setObjectName("presetCombo")
+        self.preset_combo.setToolTip("Sound to play from the selected bank.")
         self.preset_combo.currentIndexChanged.connect(self._on_preset_index_changed)
+
+        # A plug-in has no banks or presets to list: its sounds are chosen in its own window.
+        # While one is the instrument, this row takes the place of Bank and Preset.
+        self.plugin_sound_row = QWidget(self.controls_card)
+        plugin_sound_layout = QHBoxLayout(self.plugin_sound_row)
+        plugin_sound_layout.setContentsMargins(0, 0, 0, 0)
+        plugin_sound_layout.setSpacing(self._sp(8))
+        self.plugin_window_button = QPushButton("Open Plug-in Window", self.plugin_sound_row)
+        self.plugin_window_button.setObjectName("actionButton")
+        self.plugin_window_button.setToolTip("Open the plug-in's own window to choose and adjust its sound.")
+        self.plugin_window_button.setEnabled(False)
+        self.plugin_window_button.clicked.connect(lambda: self.pluginEditorRequested.emit(-1))
+        self.plugin_sound_hint = ElidedLabel(self.plugin_sound_row)
+        self.plugin_sound_hint.setObjectName("settingHint")
+        self.plugin_sound_hint.set_full_text(PLUGIN_SOUND_HINT, PLUGIN_SOUND_TOOLTIP)
+        plugin_sound_layout.addWidget(self.plugin_window_button)
+        plugin_sound_layout.addWidget(self.plugin_sound_hint, 1)
+        self.plugin_sound_row.hide()
 
         midi_label = QLabel("MIDI In", self.controls_card)
         midi_label.setObjectName("settingLabel")
@@ -780,6 +866,10 @@ class MainWindow(QMainWindow):
                 else:
                     self._configure_settings_row(row)
 
+        split_outer = self.split_body.layout()
+        if isinstance(split_outer, QVBoxLayout):
+            split_outer.setSpacing(self._sp(8))
+        configure_split_grid(self.split_grid, self._sp)
         for zone_controls in self.split_zone_controls:
             zone_controls.refresh_metrics()
 
@@ -792,6 +882,10 @@ class MainWindow(QMainWindow):
         for label in getattr(self, "_controls_labels", []):
             label.setMinimumWidth(label_width)
             label.setMaximumWidth(label_width)
+        # The Bank and Preset labels are hidden for a plug-in; their columns keep their width
+        # so that nothing else in the panel moves.
+        for column in (2, 4):
+            self.controls_grid.setColumnMinimumWidth(column, label_width)
 
         self.instrument_combo.setMinimumWidth(self._sp(200))
         self.midi_input_combo.setMinimumWidth(self._sp(200))
@@ -803,6 +897,8 @@ class MainWindow(QMainWindow):
         all_notes_target_width = label_width + self.controls_grid.horizontalSpacing() + self.bank_combo.minimumWidth()
         self.all_notes_off_button.setMinimumWidth(all_notes_target_width)
         self.all_notes_off_button.setMaximumWidth(all_notes_target_width)
+        self.plugin_sound_row.layout().setSpacing(self.controls_grid.horizontalSpacing())
+        self._sync_plugin_sound_row(all_notes_target_width)
         self.recording_toggle_button.setMinimumWidth(self._sp(108))
         self.recording_timer_label.setMinimumWidth(self._sp(50))
         self.recording_timer_label.setMaximumWidth(self._sp(58))
@@ -828,6 +924,18 @@ class MainWindow(QMainWindow):
                 self._refresh_pin_toggle_icon()
             self._refresh_footer_action_icons(icon_px)
         QTimer.singleShot(0, self, self._sync_all_notes_off_width)
+
+    def _sync_plugin_sound_row(self, all_notes_width: int | None = None) -> None:
+        """Sizes the plug-in window button: directly above All Notes OFF and as wide, and as
+        tall as the lists it stands in for."""
+        if all_notes_width is None:
+            all_notes_width = (self._sp(84) + self.controls_grid.horizontalSpacing()
+                               + self.bank_combo.minimumWidth())
+        width = max(all_notes_width, self.plugin_window_button.sizeHint().width())
+        self.plugin_window_button.setFixedSize(width, self.instrument_combo.sizeHint().height())
+        if self._plugin_sound_mode:
+            self.all_notes_off_button.setMinimumWidth(width)
+            self.all_notes_off_button.setMaximumWidth(width)
 
     def _create_section_card(self, title: str, parent: QWidget) -> tuple[QFrame, QVBoxLayout]:
         return create_section_card(title, parent)
@@ -941,6 +1049,12 @@ class MainWindow(QMainWindow):
         self.controls_toggle_button.setChecked(self._controls_visible)
         self.controls_toggle_button.clicked.connect(self._on_controls_toggle_clicked)
 
+        self.split_toggle_button = FooterButton("", self.footer_bar)
+        self.split_toggle_button.setObjectName("footerIcon")
+        self.split_toggle_button.setCheckable(True)
+        self.split_toggle_button.setChecked(self._split_visible)
+        self.split_toggle_button.clicked.connect(self._on_split_toggle_clicked)
+
         self.tutorial_button = FooterButton("Tutorial", self.footer_bar)
         self.tutorial_button.setObjectName("footerLink")
         self.tutorial_button.clicked.connect(self.tutorialRequested.emit)
@@ -956,6 +1070,7 @@ class MainWindow(QMainWindow):
             self.settings_toggle_button,
             self.stats_toggle_button,
             self.controls_toggle_button,
+            self.split_toggle_button,
             self.tutorial_button,
             self.website_button,
             self.donate_button,
@@ -968,6 +1083,7 @@ class MainWindow(QMainWindow):
             (self.pin_toggle_button, "Keep window on top", "Pin or unpin this window"),
             (self.settings_toggle_button, "Settings", "Show or hide settings"),
             (self.controls_toggle_button, "Controls", "Show controls"),
+            (self.split_toggle_button, "Keyboard split", "Show keyboard split"),
             (self.stats_toggle_button, "Stats", "Hide stats"),
             (self.website_button, "Official website", "Open the OpenPiano website in your browser"),
             (self.tutorial_button, "Tutorial", "Start the guided tutorial"),
@@ -976,7 +1092,7 @@ class MainWindow(QMainWindow):
             describe_footer_button(button, name, description)
         footer_buttons = (
             self.theme_toggle_button, self.pin_toggle_button, self.settings_toggle_button,
-            self.controls_toggle_button, self.stats_toggle_button,
+            self.controls_toggle_button, self.split_toggle_button, self.stats_toggle_button,
             self.website_button, self.tutorial_button, self.donate_button,
         )
         for previous, following in zip(footer_buttons, footer_buttons[1:]):
@@ -986,6 +1102,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.pin_toggle_button, 0, Qt.AlignLeft)
         row.addWidget(self.settings_toggle_button, 0, Qt.AlignLeft)
         row.addWidget(self.controls_toggle_button, 0, Qt.AlignLeft)
+        row.addWidget(self.split_toggle_button, 0, Qt.AlignLeft)
         row.addWidget(self.stats_toggle_button, 0, Qt.AlignLeft)
         row.addStretch(1)
         row.addWidget(self.website_button, 0, Qt.AlignRight)
@@ -1005,6 +1122,7 @@ class MainWindow(QMainWindow):
         for button, name in (
             (self.settings_toggle_button, "settings"),
             (self.controls_toggle_button, "controls"),
+            (self.split_toggle_button, "split"),
             (self.stats_toggle_button, "stats"),
             (self.website_button, "website"),
         ):
@@ -1109,7 +1227,7 @@ class MainWindow(QMainWindow):
 
     def _set_interaction_cursors(self) -> None:
         self.piano_widget.setFocusPolicy(Qt.StrongFocus)
-        for scroll_area in (self.settings_scroll, self.controls_scroll):
+        for scroll_area in (self.settings_scroll, self.controls_scroll, self.split_scroll):
             scroll_area.setFocusPolicy(Qt.NoFocus)
             scroll_area.viewport().setFocusPolicy(Qt.NoFocus)
         for button in self.findChildren(QPushButton):
@@ -1305,7 +1423,8 @@ class MainWindow(QMainWindow):
     def _sync_all_notes_off_width(self) -> None:
         if not hasattr(self, "controls_actions"):
             return
-        if self.bank_combo.width() <= 0:
+        if self._plugin_sound_mode or self.bank_combo.width() <= 0:
+            # With a plug-in selected the Bank list is hidden and its place means nothing.
             return
         action_left = self.controls_actions.x()
         bank_right = self.bank_combo.x() + self.bank_combo.width()
@@ -1375,12 +1494,13 @@ class MainWindow(QMainWindow):
                 background: {self.theme.app_bg};
                 border: none;
             }}
-            #controlsScroll {{
+            #controlsScroll, #splitScroll {{
                 background: {self.theme.app_bg};
                 border: none;
             }}
             QScrollArea#settingsScroll[effectsPopup="true"],
-            QScrollArea#controlsScroll[effectsPopup="true"] {{
+            QScrollArea#controlsScroll[effectsPopup="true"],
+            QScrollArea#splitScroll[effectsPopup="true"] {{
                 background: {self.theme.panel_bg};
                 border: 1px solid {self.theme.border};
                 border-radius: 8px;
@@ -1389,23 +1509,26 @@ class MainWindow(QMainWindow):
                 background: {self.theme.app_bg};
                 border: none;
             }}
-            QScrollArea#controlsScroll QWidget#qt_scrollarea_viewport {{
+            QScrollArea#controlsScroll QWidget#qt_scrollarea_viewport,
+            QScrollArea#splitScroll QWidget#qt_scrollarea_viewport {{
                 background: {self.theme.app_bg};
                 border: none;
             }}
             QScrollArea#settingsScroll[effectsPopup="true"] QWidget#qt_scrollarea_viewport,
-            QScrollArea#controlsScroll[effectsPopup="true"] QWidget#qt_scrollarea_viewport {{
+            QScrollArea#controlsScroll[effectsPopup="true"] QWidget#qt_scrollarea_viewport,
+            QScrollArea#splitScroll[effectsPopup="true"] QWidget#qt_scrollarea_viewport {{
                 background: {self.theme.panel_bg};
                 border: none;
             }}
             QScrollArea#settingsScroll[effectsPopup="true"] #settingsBody,
-            QScrollArea#controlsScroll[effectsPopup="true"] #controlsBody {{
+            QScrollArea#controlsScroll[effectsPopup="true"] #controlsBody,
+            QScrollArea#splitScroll[effectsPopup="true"] #splitBody {{
                 background: {popup_body_bg};
             }}
             #settingsBody {{
                 background: {self.theme.app_bg};
             }}
-            #controlsBody {{
+            #controlsBody, #splitBody {{
                 background: {self.theme.app_bg};
             }}
             #settingsCard {{
@@ -1468,6 +1591,9 @@ class MainWindow(QMainWindow):
                 padding-right: {self._sp(32)}px;
                 font: 600 {label_font}pt "Segoe UI";
                 min-height: {combo_height}px;
+            }}
+            #splitCombo {{
+                padding-right: {self._sp(5)}px;
             }}
             #instrumentCombo::drop-down,
             #bankCombo::drop-down,
@@ -1680,6 +1806,7 @@ class MainWindow(QMainWindow):
             normal_widgets = (
                 self.stats_bar,
                 self.controls_scroll,
+                self.split_scroll,
                 self.panel_divider,
                 self.settings_scroll,
             )
@@ -1692,6 +1819,7 @@ class MainWindow(QMainWindow):
             self._effects_panels_detached = False
             self.stats_bar.setProperty("effectsPopup", False)
             self.controls_scroll.setProperty("effectsPopup", False)
+            self.split_scroll.setProperty("effectsPopup", False)
             self.settings_scroll.setProperty("effectsPopup", False)
             self._refresh_effects_popup_polish()
             self.footer_bar.show()
@@ -1699,16 +1827,18 @@ class MainWindow(QMainWindow):
 
         if self._effects_panels_detached:
             return
-        for widget in (self.stats_bar, self.controls_scroll, self.panel_divider, self.settings_scroll):
+        for widget in (self.stats_bar, self.controls_scroll, self.split_scroll, self.panel_divider,
+                       self.settings_scroll):
             self._outer_layout.removeWidget(widget)
         self._effects_panels_detached = True
         self.stats_bar.setProperty("effectsPopup", True)
         self.controls_scroll.setProperty("effectsPopup", True)
+        self.split_scroll.setProperty("effectsPopup", True)
         self.settings_scroll.setProperty("effectsPopup", True)
         self._refresh_effects_popup_polish()
 
     def _refresh_effects_popup_polish(self) -> None:
-        for widget in (self.stats_bar, self.controls_scroll, self.settings_scroll):
+        for widget in (self.stats_bar, self.controls_scroll, self.split_scroll, self.settings_scroll):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
             widget.update()
@@ -1760,7 +1890,8 @@ class MainWindow(QMainWindow):
             return
         margin = self._sp(14)
         gap = self._sp(10)
-        width = max(1, min(root.width() - (margin * 2), self._sp(980)))
+        widest = max(1, root.width() - (margin * 2))
+        width = min(widest, self._sp(980))
         x = max(margin, int((root.width() - width) / 2))
         piano_key_top = self.piano_widget.y() + self.piano_widget.key_top_y()
         footer_top = self.footer_bar.y() if self.footer_bar.y() > 0 else root.height()
@@ -1769,20 +1900,27 @@ class MainWindow(QMainWindow):
         for widget, visible in (
             (self.controls_scroll, self._controls_visible),
             (self.stats_bar, self._stats_visible),
+            (self.split_scroll, self._split_visible),
             (self.settings_scroll, self._settings_visible),
         ):
             if visible:
                 widget.show()
+                widget_x, widget_width = x, width
                 if widget is self.controls_scroll:
                     desired_height = self._sp(90)
                 elif widget is self.settings_scroll:
                     desired_height = self._sp(236)
+                elif widget is self.split_scroll:
+                    desired_height = self._split_panel_height()
+                    # Its rows cannot wrap, so it takes the width they need.
+                    widget_width = min(widest, max(width, self._split_panel_width()))
+                    widget_x = max(margin, int((root.width() - widget_width) / 2))
                 else:
                     desired_height = max(self._sp(56), widget.sizeHint().height())
                 available_height = max(self._sp(42), y - margin)
                 height = min(desired_height, available_height)
                 y -= height
-                widget.setGeometry(x, max(margin, y), width, height)
+                widget.setGeometry(widget_x, max(margin, y), widget_width, height)
                 widget.raise_()
                 y -= gap
             else:
@@ -1805,6 +1943,7 @@ class MainWindow(QMainWindow):
         self._set_effects_panels_attached(True)
         self.stats_bar.setVisible(self._stats_visible)
         self.controls_scroll.setVisible(self._controls_visible)
+        self.split_scroll.setVisible(self._split_visible)
         self.settings_scroll.setVisible(self._settings_visible)
         self._update_panel_divider_visibility()
         self.footer_bar.show()
@@ -1881,6 +2020,7 @@ class MainWindow(QMainWindow):
             self._sync_keybind_overlay()
             self._position_effects_overlays()
             return
+        self._sync_split_panel_height()
         self.centralWidget().layout().activate()
         self.adjustSize()
         target_size = self.sizeHint()
@@ -2030,6 +2170,7 @@ class MainWindow(QMainWindow):
             return
         instrument_id = self.instrument_combo.itemData(index, role=Qt.UserRole)
         if isinstance(instrument_id, str):
+            self._refresh_program_controls_mode()
             self.instrumentChanged.emit(instrument_id)
 
     def _on_bank_index_changed(self, index: int) -> None:
@@ -2186,6 +2327,10 @@ class MainWindow(QMainWindow):
         self.controlsToggled.emit(not self._controls_visible)
         self.controls_toggle_button.setChecked(self._controls_visible)
 
+    def _on_split_toggle_clicked(self) -> None:
+        self.splitToggled.emit(not self._split_visible)
+        self.split_toggle_button.setChecked(self._split_visible)
+
     def _on_stats_toggle_clicked(self) -> None:
         self.statsToggled.emit(not self._stats_visible)
         self.stats_toggle_button.setChecked(self._stats_visible)
@@ -2300,11 +2445,14 @@ class MainWindow(QMainWindow):
         return response == QMessageBox.Yes
 
     def set_audio_loading(self, name: str) -> None:
+        self._audio_loading = bool(name)
         self.instrument_label.setText('Loading...' if name else 'Instrument')
         self.instrument_label.setToolTip(f'Loading {name}' if name else '')
         for control in (self.bank_combo, self.preset_combo, self.family_combo):
             control.set_loading(bool(name))
-            control.setEnabled(not bool(name))
+            # Nothing to choose from an empty list, so it is not offered as if there were.
+            control.setEnabled(not bool(name) and control.count() > 0)
+        self._refresh_program_controls_mode()
         self._refresh_scaled_layout_metrics()
         self.refresh_fixed_size()
 
@@ -2669,6 +2817,34 @@ class MainWindow(QMainWindow):
             selected=str(selected_id or ""),
             default_index=0,
         )
+        self._refresh_program_controls_mode()
+
+    def _refresh_program_controls_mode(self) -> None:
+        """Shows Bank and Preset for a SoundFont, and the plug-in window button for a plug-in.
+
+        It follows the instrument shown in the list, so the controls already fit the new
+        instrument while it is loading."""
+        plugin = is_plugin_instrument_id(self.instrument_combo.currentData(Qt.UserRole))
+        changed = plugin != self._plugin_sound_mode
+        self._plugin_sound_mode = plugin
+        self.bank_label.setVisible(not plugin)
+        self.bank_combo.setVisible(not plugin and not self._family_browsing)
+        self.family_combo.setVisible(not plugin and self._family_browsing)
+        self.preset_label.setVisible(not plugin)
+        self.preset_combo.setVisible(not plugin)
+        # It is in the grid only while it shows: a hidden widget that spans several columns
+        # makes Qt drop the spacing between them.
+        in_grid = self.controls_grid.indexOf(self.plugin_sound_row) >= 0
+        if plugin and not in_grid:
+            self.controls_grid.addWidget(self.plugin_sound_row, 0, 2, 1, 4)
+        elif not plugin and in_grid:
+            self.controls_grid.removeWidget(self.plugin_sound_row)
+        self.plugin_sound_row.setVisible(plugin)
+        self.plugin_window_button.setEnabled(self._plugin_editor_available and not self._audio_loading)
+        if changed:
+            # All Notes OFF follows the button above it, or goes back to following Bank.
+            self._refresh_scaled_layout_metrics()
+            self._schedule_layout_refresh()
 
     def set_split_instruments(self, instruments: list[InstrumentInfo]) -> None:
         options = instrument_options(instruments)
@@ -2705,7 +2881,9 @@ class MainWindow(QMainWindow):
         self.plugin_controls.set_status(text, details, available=available, scanning=scanning)
 
     def set_plugin_editor_available(self, available: bool) -> None:
+        self._plugin_editor_available = bool(available)
         self.plugin_controls.set_editor_available(available)
+        self.plugin_window_button.setEnabled(self._plugin_editor_available and not self._audio_loading)
 
     def show_plugin_details(self) -> None:
         dialog = PluginDetailsDialog(self, self.theme, self.plugin_controls.report_text())
@@ -2749,8 +2927,7 @@ class MainWindow(QMainWindow):
         self._family_instrument_id = instrument_id
         self.bank_label.setText("Bank")
         self.bank_label.setBuddy(self.family_combo if family_browsing else self.bank_combo)
-        self.bank_combo.setVisible(not family_browsing)
-        self.family_combo.setVisible(family_browsing)
+        self._refresh_program_controls_mode()
         self.preset_combo.setMinimumWidth(self._sp(220 if family_browsing else
                                                  220 if piano_bank else 160 if self.preset_combo._loading else 80))
         if family_browsing:
@@ -3015,12 +3192,25 @@ class MainWindow(QMainWindow):
     def _sync_drawer_visibility(self) -> None:
         self._settings_visible = self._drawer_state.settings_visible
         self._controls_visible = self._drawer_state.controls_visible
-        self.settings_scroll.setVisible(self._settings_visible)
-        self.controls_scroll.setVisible(self._controls_visible)
+        self._split_visible = self._drawer_state.split_visible
+        if not self._split_visible:
+            self._close_split_range_pickers()
+        # The one being closed goes first, so that Settings and Keyboard Split, which take
+        # each other's place, are never laid out together.
+        for scroll_area, visible in sorted(
+            ((self.settings_scroll, self._settings_visible), (self.controls_scroll, self._controls_visible),
+             (self.split_scroll, self._split_visible)),
+            key=lambda item: item[1],
+        ):
+            scroll_area.setVisible(visible)
+        self._sync_split_panel_height()
         self.settings_toggle_button.setChecked(self._settings_visible)
         self.settings_toggle_button.setToolTip("Hide settings" if self._settings_visible else "Show settings")
         self.controls_toggle_button.setChecked(self._controls_visible)
         self.controls_toggle_button.setToolTip("Hide controls" if self._controls_visible else "Show controls")
+        self.split_toggle_button.setChecked(self._split_visible)
+        self.split_toggle_button.setToolTip(
+            "Hide keyboard split" if self._split_visible else "Show keyboard split")
         if self._effects_layout_active:
             self.panel_divider.setVisible(False)
             self._position_effects_overlays()
@@ -3036,6 +3226,18 @@ class MainWindow(QMainWindow):
     def set_controls_visible(self, visible: bool) -> None:
         self._drawer_state.set_controls_visible(bool(visible))
         self._sync_drawer_visibility()
+
+    def set_split_visible(self, visible: bool) -> None:
+        """Shows or hides the Keyboard Split drawer. It takes the place of Settings, so
+        showing either of the two hides the other."""
+        self._drawer_state.set_split_visible(bool(visible))
+        self._sync_drawer_visibility()
+
+    def _close_split_range_pickers(self) -> None:
+        for zone_controls in self.split_zone_controls:
+            popup = zone_controls.range_picker()
+            if popup is not None:
+                popup.hide()
 
     def set_stats_visible(self, visible: bool) -> None:
         self._stats_visible = bool(visible)

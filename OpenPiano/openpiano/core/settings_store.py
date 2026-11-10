@@ -77,6 +77,7 @@ class AppSettings:
     custom_keybinds: dict[str, str] = field(default_factory=dict)
     split_zones: tuple[SplitZone, ...] = field(default_factory=default_split_zones)
     plugin_folders: tuple[str, ...] = ()
+    split_open: bool = False
 
 
 def _appdata_settings_dir() -> Path | None:
@@ -291,6 +292,7 @@ def load_settings(path: Path | None = None) -> AppSettings:
     custom_keybinds = _clamp_custom_keybinds(payload.get("custom_keybinds"))
     split_zones = normalize_split_zones(payload.get("split_zones"))
     plugin_folders = _clamp_plugin_folders(payload.get("plugin_folders"))
+    split_open = _clamp_bool(payload.get("split_open"), False)
     return AppSettings(
         mode=mode,
         instrument_id=instrument_id,
@@ -323,6 +325,7 @@ def load_settings(path: Path | None = None) -> AppSettings:
         custom_keybinds=custom_keybinds,
         split_zones=split_zones,
         plugin_folders=plugin_folders,
+        split_open=split_open,
     )
 
 
@@ -364,6 +367,7 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
         "custom_keybinds": _clamp_custom_keybinds(settings.custom_keybinds),
         "split_zones": split_zones_payload(settings.split_zones),
         "plugin_folders": list(_clamp_plugin_folders(settings.plugin_folders)),
+        "split_open": _clamp_bool(settings.split_open, False),
     }
     raw = json.dumps(payload, indent=2)
 
