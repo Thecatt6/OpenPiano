@@ -200,6 +200,8 @@ class PianoAppController(QObject):
         self._plugin_folders = tuple(self._plugin_library.folders)
         self._plugin_startup_notice = ""
         self._pending_plugin_instrument_id = ""
+        # The zone whose plug-in window was asked for before its plug-in had loaded.
+        self._pending_zone_editor: int | None = None
         self._skip_plugins_interrupted_last_time()
         self._space_override_off = False
         self._pedal_state = PedalState()
@@ -1213,6 +1215,8 @@ class PianoAppController(QObject):
             return
         changes = dict(changes)
         current = self._split_zones[index]
+        if index == self._pending_zone_editor and ("instrument_id" in changes or changes.get("enabled") is False):
+            self._pending_zone_editor = None
         if changes.get("enabled") and not current.enabled and not current.instrument_id \
                 and "instrument_id" not in changes:
             # A zone needs a sound to be audible: start from the default SoundFont.
@@ -1240,6 +1244,29 @@ class PianoAppController(QObject):
             self._split_zones = update_split_zone(self._split_zones, index, bank=state.bank, preset=state.preset)
             self._schedule_persist()
         self.window.set_split_zone_state(index, state)
+        if index == self._pending_zone_editor and state.status != "loading":
+            self._pending_zone_editor = None
+            if state.status == "ready" and state.is_plugin and state.instrument_id == zone.instrument_id:
+                # Through the queue, like a click: the plug-in window keeps its caller busy
+                # for as long as it stays open.
+                self.window.pluginEditorRequested.emit(index)
+
+    def _zone_plugin_window_ready(self, index: int) -> bool:
+        """True when the zone's plug-in is loaded and its window can be opened now. If it is
+        not, the zone is switched on when it was off, and the window opens by itself as soon
+        as the plug-in has loaded."""
+        if not 0 <= index < len(self._split_zones):
+            return False
+        zone = self._split_zones[index]
+        if not is_plugin_instrument_id(zone.instrument_id):
+            return False
+        if not zone.enabled:
+            self._on_split_zone_changed(index, {"enabled": True})
+        state = self._split_manager.state(index)
+        if state.status == "ready":
+            return True
+        self._pending_zone_editor = index if state.status == "loading" else None
+        return False
 
     def _refresh_plugin_status(self) -> None:
         library = self._plugin_library
@@ -1288,6 +1315,8 @@ class PianoAppController(QObject):
         if self._is_shutdown:
             return
         index = int(index)
+        if index >= 0 and not self._zone_plugin_window_ready(index):
+            return
         engine = self.audio_engine if index < 0 else self._split_manager.engine(index)
         opener = getattr(engine, 'open_editor', None)
         if not callable(opener) or getattr(engine, 'editor_open', False):

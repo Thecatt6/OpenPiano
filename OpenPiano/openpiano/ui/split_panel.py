@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from openpiano.core.config import MASTER_VOLUME_MAX
+from openpiano.core.plugin_registry import is_plugin_instrument_id
 from openpiano.core.split import (
     SPLIT_NOTE_MAX,
     SPLIT_NOTE_MIN,
@@ -121,6 +122,8 @@ class SplitZoneControls(QObject):
         self._theme = theme
         self._enabled = False
         self._ready = False
+        self._status_text = ""
+        self._engine_is_plugin = False
         self._instrument_id = ""
         self._low = SPLIT_NOTE_MIN
         self._high = SPLIT_NOTE_MAX
@@ -155,7 +158,10 @@ class SplitZoneControls(QObject):
         self.program_combo.currentIndexChanged.connect(self._on_program_index_changed)
         self.editor_button = QPushButton("Plug-in Window", card)
         self.editor_button.setObjectName("actionButton")
-        self.editor_button.setToolTip("Open this zone's plug-in window, where the plug-in's sounds are chosen.")
+        self.editor_button.setToolTip(
+            "Open this zone's plug-in window, where the plug-in's sounds are chosen.\n"
+            "Each zone has its own copy of the plug-in, with its own sound.\n"
+            "If the zone is off, this switches it on first.")
         self.editor_button.clicked.connect(lambda: self.editorRequested.emit(self.index))
         self.editor_button.setVisible(False)
         self.status_label = ElidedLabel(card)
@@ -299,7 +305,17 @@ class SplitZoneControls(QObject):
             widget.setEnabled(self._enabled)
         self.instrument_combo.setEnabled(self.instrument_combo.count() > 0)
         self.program_combo.setEnabled(self._enabled and self._ready and self.program_combo.count() > 0)
-        self.editor_button.setEnabled(self._enabled and self._ready)
+
+    def _refresh_preset_cell(self) -> None:
+        """Shows the one occupant of the preset column that fits the zone's sound."""
+        text = self._status_text
+        # A plug-in chooses its sounds in its own window, so it gets that button instead of
+        # the preset list. It is there as soon as a plug-in is picked, also while the zone is
+        # off, so that it is clear where the sound is chosen.
+        plugin = is_plugin_instrument_id(self._instrument_id) or (self._ready and self._engine_is_plugin)
+        self.status_label.setVisible(bool(text))
+        self.program_combo.setVisible(not text and not plugin)
+        self.editor_button.setVisible(not text and plugin)
 
     def set_zone(self, zone: SplitZone, others: Sequence[OtherRange] = ()) -> None:
         self._enabled = bool(zone.enabled)
@@ -321,6 +337,7 @@ class SplitZoneControls(QObject):
         self.volume_slider.setValue(round(zone.volume * 100))
         self.volume_slider.blockSignals(blocked)
         self.volume_value.setText(f"{round(zone.volume * 100)}%")
+        self._refresh_preset_cell()
         self._refresh_enabled()
 
     def set_instrument_options(self, options: list[tuple[str, object]]) -> None:
@@ -331,15 +348,13 @@ class SplitZoneControls(QObject):
                   program_names: dict[int, dict[int, str]] | None = None, bank: int = 0, preset: int = 0,
                   is_plugin: bool = False) -> None:
         self._ready = status == "ready"
+        self._engine_is_plugin = bool(is_plugin)
         text = {"loading": "Loading…", "error": error or "Could not load this sound."}.get(status, "")
+        self._status_text = text
         self.status_label.set_full_text(text, text if status == "error" else "")
         options = zone_program_options(programs or {}, program_names) if self._ready else []
         _fill_combo(self.program_combo, options, (int(bank), int(preset)))
-        # A plug-in chooses its sounds in its own window, so it gets that button instead.
-        plugin_ready = self._ready and is_plugin
-        self.status_label.setVisible(bool(text))
-        self.program_combo.setVisible(not text and not plugin_ready)
-        self.editor_button.setVisible(not text and plugin_ready)
+        self._refresh_preset_cell()
         self._refresh_enabled()
 
 
