@@ -88,6 +88,8 @@ OpenPiano includes Default and Grand Piano SoundFonts, listed as **OpenPiano Bui
 
 Use **Controls** to select the instrument. A SoundFont file holds many sounds: **Bank** is the group of sounds inside the file and **Preset** is the sound itself. Adjust volume, note strength, sustain and pitch in **Settings > Sound**.
 
+Some sounds do not cover the whole keyboard: a flute has no low notes, a drum kit has gaps. When a SoundFont sound is loaded or its preset changes, OpenPiano reads from the file which keys the sound can play and draws the others in gray. A gray key can still be pressed, it just makes no sound. The same is shown for the SoundFont of each split zone, taking its octave shift into account. Keys played by a VST3 plug-in are never gray, because a plug-in does not say which notes it can play.
+
 ### Play VST3 instrument plug-ins
 
 OpenPiano looks for VST3 instrument plug-ins each time it starts and adds the ones it finds to the instrument list in **Controls**, marked **VST3 Plug-in**. It searches the standard Windows locations (`C:\Program Files\Common Files\VST3` and `%LOCALAPPDATA%\Programs\Common\VST3`) and `%LOCALAPPDATA%\OpenPiano\plugins`. Add more locations with **Settings > Plug-ins (VST3) > Plug-in Folders…**, and use **Rescan Plug-ins** after installing a new plug-in while OpenPiano is open.

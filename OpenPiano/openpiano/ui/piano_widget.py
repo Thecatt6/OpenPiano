@@ -76,6 +76,19 @@ def _with_alpha(color: QColor, alpha: int) -> QColor:
     return copy
 
 
+_SILENT_WHITE_KEY = "#9A9CA2"
+_SILENT_BLACK_KEY = "#5E6067"
+
+
+def _silent_key_color(key_color: QColor, black: bool) -> QColor:
+    """The gray of a key that makes no sound with the loaded sounds."""
+    gray = QColor(_SILENT_BLACK_KEY if black else _SILENT_WHITE_KEY)
+    if abs(gray.lightnessF() - key_color.lightnessF()) < 0.16:
+        # A custom key colour close to the gray would hide it: move the gray away from it.
+        gray = gray.darker(165) if key_color.lightnessF() >= gray.lightnessF() else gray.lighter(165)
+    return gray
+
+
 def _readable_text_color(background: QColor) -> QColor:
     luminance = (
         (0.2126 * background.redF())
@@ -126,6 +139,7 @@ class PianoWidget(QWidget):
         self._last_effect_tick = 0.0
         self._anim_timer_id = 0
         self._split_zones: tuple = ()
+        self._silent_notes: frozenset[int] = frozenset()
         self.setMouseTracking(True)
 
     def _ensure_animation_timer(self) -> None:
@@ -235,6 +249,21 @@ class PianoWidget(QWidget):
             return
         self._split_zones = zones
         self.update()
+
+    def set_silent_notes(self, notes) -> None:
+        """Keys that make no sound with the loaded sounds; they are drawn gray while not pressed."""
+        notes = frozenset(int(note) for note in (notes or ()))
+        if notes == self._silent_notes:
+            return
+        self._silent_notes = notes
+        self.update()
+
+    def silent_notes(self) -> frozenset[int]:
+        return self._silent_notes
+
+    def _resting_key_color(self, note: int, black: bool) -> QColor:
+        color = QColor(self._theme.black_key if black else self._theme.white_key)
+        return _silent_key_color(color, black) if note in self._silent_notes else color
 
     def split_marker_runs(self) -> list[tuple[int, int, int]]:
         """Runs of neighbouring keys that share a split zone, as (zone index, first note, last note)."""
@@ -584,7 +613,7 @@ class PianoWidget(QWidget):
 
     def _note_fill_color(self, note: int) -> QColor:
         is_black = is_black_key(note)
-        base = QColor(self._theme.black_key if is_black else self._theme.white_key)
+        base = self._resting_key_color(note, is_black)
         pressed = QColor(self._theme.black_key_pressed if is_black else self._theme.white_key_pressed)
         t = self._anim_t.get(note, 1.0 if note in self._pressed_notes else 0.0)
         return _lerp_color(base, pressed, t)
@@ -872,7 +901,7 @@ class PianoWidget(QWidget):
         return self._anim_t.get(note, 1.0 if note in self._pressed_notes else 0.0)
 
     def _premium_key_gradient(self, rect: QRectF, note: int, *, black: bool) -> QLinearGradient:
-        base = QColor(self._theme.black_key if black else self._theme.white_key)
+        base = self._resting_key_color(note, black)
         pressed = QColor(self._theme.black_key_pressed if black else self._theme.white_key_pressed)
         t = self._pressed_amount(note)
         mixed = _lerp_color(base, pressed, t)
@@ -883,10 +912,14 @@ class PianoWidget(QWidget):
             gradient.setColorAt(0.58, mixed)
             gradient.setColorAt(1.00, mixed.darker(155))
         else:
-            warm_top = _lerp_color(base, QColor("#FAF7EF"), 0.58)
-            warm_upper = _lerp_color(base, QColor("#F0EDE5"), 0.42)
-            warm_lower = _lerp_color(base, QColor("#DEDAD1"), 0.22)
-            warm_bottom = _lerp_color(base, QColor("#C8C4B9"), 0.32)
+            if note in self._silent_notes:
+                # The warm ivory tones would wash the gray out.
+                warm_top, warm_upper, warm_lower, warm_bottom = base.lighter(112), base.lighter(105), base, base.darker(114)
+            else:
+                warm_top = _lerp_color(base, QColor("#FAF7EF"), 0.58)
+                warm_upper = _lerp_color(base, QColor("#F0EDE5"), 0.42)
+                warm_lower = _lerp_color(base, QColor("#DEDAD1"), 0.22)
+                warm_bottom = _lerp_color(base, QColor("#C8C4B9"), 0.32)
             pressed_top = pressed.lighter(138)
             pressed_upper = pressed.lighter(108)
             pressed_lower = pressed

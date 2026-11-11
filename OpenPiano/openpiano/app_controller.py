@@ -92,6 +92,7 @@ from openpiano.core.sound_presets import (
     trigger_from_event,
     trigger_label,
 )
+from openpiano.core.soundfont_keys import playable_keys, silent_notes
 from openpiano.core.split import normalize_split_zones, update_split_zone
 from openpiano.core.stats_logic import collect_stats_values, trim_kps_events
 from openpiano.core.theme import apply_key_color_overrides, get_theme
@@ -629,6 +630,7 @@ class PianoAppController(QObject):
             self.window.set_instruments(self._instruments, self._instrument_id)
             self._refresh_program_controls()
             self._refresh_plugin_editor_button()
+            self._refresh_silent_keys()
             if self._audio_session.is_latest(result.request):
                 self._audio_request = None
                 self._staged_plugin_states.pop("main", None)
@@ -706,6 +708,7 @@ class PianoAppController(QObject):
         self.audio_available = False
         self.audio_engine = SilentAudioEngine()
         self._audio_handoff = False
+        self._refresh_silent_keys()
         if self.window.ask_audio_retry(detail):
             self._retry_audio()
 
@@ -1261,9 +1264,30 @@ class PianoAppController(QObject):
         self._instrument_bank = int(current_bank)
         self._instrument_preset = int(current_preset)
         self._refresh_program_controls()
+        self._refresh_silent_keys()
         if persist:
             self._schedule_persist()
         return True
+
+    def _playable_keys_of(self, instrument_id: str, bank: int, preset: int) -> frozenset[int] | None:
+        """The notes a SoundFont instrument can play. None for a plug-in: its range cannot be read."""
+        instrument = self._instrument_by_id.get(instrument_id)
+        if instrument is None or instrument.source == "plugin" or is_plugin_instrument_id(instrument_id):
+            return None
+        return playable_keys(instrument.path, bank, preset)
+
+    def _refresh_silent_keys(self) -> None:
+        """Shows in gray the keys that the main sound and the split zones cannot play."""
+        main_keys = None
+        if self.audio_available and self._instrument_id:
+            main_keys = self._playable_keys_of(self._instrument_id, self._instrument_bank, self._instrument_preset)
+        zone_keys: list[frozenset[int] | None] = []
+        for index, zone in enumerate(self._split_zones):
+            state = self._split_manager.state(index)
+            loaded = (zone.enabled and state.status == "ready" and not state.is_plugin
+                      and state.instrument_id == zone.instrument_id)
+            zone_keys.append(self._playable_keys_of(state.instrument_id, state.bank, state.preset) if loaded else None)
+        self.window.piano_widget.set_silent_notes(silent_notes(main_keys, self._split_zones, zone_keys))
 
     def _configure_split_zones(self) -> None:
         self.window.set_split_zones(self._split_zones)
@@ -1272,6 +1296,7 @@ class PianoAppController(QObject):
         self._split_manager.configure(self._split_zones, self._instrument_by_id, self._volume)
         for index in range(len(self._split_zones)):
             self.window.set_split_zone_state(index, self._split_manager.state(index))
+        self._refresh_silent_keys()
 
     def _on_split_zone_changed(self, index: int, changes: object) -> None:
         if self._is_shutdown or not isinstance(changes, dict):
@@ -1310,6 +1335,7 @@ class PianoAppController(QObject):
             self._split_zones = update_split_zone(self._split_zones, index, bank=state.bank, preset=state.preset)
             self._schedule_persist()
         self.window.set_split_zone_state(index, state)
+        self._refresh_silent_keys()
         if state.status != "loading":
             self._staged_plugin_states.pop(f"zone{index + 1}", None)
         if index == self._pending_zone_editor and state.status != "loading":
