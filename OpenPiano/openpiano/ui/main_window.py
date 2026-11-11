@@ -194,6 +194,8 @@ class MainWindow(QMainWindow):
         self._sound_presets_dialog: SoundPresetsDialog | None = None
         self._sound_preset_rows: tuple[SoundPresetRow, ...] = ()
         self._sound_preset_learning: int | None = None
+        self._sound_preset_learning_pc = False
+        self._sound_preset_notice = ""
         self._plugin_sound_mode = False
         self._plugin_editor_available = False
         self._audio_loading = False
@@ -2711,18 +2713,29 @@ class MainWindow(QMainWindow):
             if not window_icon.isNull():
                 dialog.setWindowIcon(window_icon)
             self._sound_presets_dialog = dialog
-        dialog.set_presets(self._sound_preset_rows, self._sound_preset_learning)
+        dialog.set_presets(self._sound_preset_rows, self._sound_preset_learning,
+                           self._sound_preset_learning_pc, self._sound_preset_notice)
         self._apply_windows_title_bar_theme(dialog)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
 
-    def set_sound_presets(self, rows: list[SoundPresetRow], learning_index: int | None = None) -> None:
+    def set_sound_presets(self, rows: list[SoundPresetRow], learning_index: int | None = None,
+                          learning_pc: bool = False, notice: str = "") -> None:
         self._sound_preset_rows = tuple(rows)
         self._sound_preset_learning = learning_index
+        self._sound_preset_learning_pc = bool(learning_pc)
+        self._sound_preset_notice = str(notice or "")
         dialog = self._sound_presets_dialog
         if dialog is not None and isValid(dialog):
-            dialog.set_presets(self._sound_preset_rows, learning_index)
+            dialog.set_presets(self._sound_preset_rows, learning_index, learning_pc, notice)
+
+    def sound_presets_window_active(self) -> bool:
+        """Whether the Sound Presets window is the one in front, with no name being typed."""
+        dialog = self._sound_presets_dialog
+        if dialog is None or not isValid(dialog) or QApplication.activeWindow() is not dialog:
+            return False
+        return not isinstance(QApplication.focusWidget(), QLineEdit)
 
     def ask_plugin_folders(self, default_folders: list[str], folders: list[str]) -> list[str] | None:
         dialog = PluginFoldersDialog(self, self.theme, default_folders, folders)

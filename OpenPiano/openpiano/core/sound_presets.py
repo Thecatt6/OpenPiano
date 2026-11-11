@@ -9,6 +9,13 @@ from openpiano.core.config import (
     INSTRUMENT_PRESET_MAX,
     INSTRUMENT_PRESET_MIN,
 )
+from openpiano.core.keymap import (
+    Binding,
+    binding_from_id,
+    binding_reserved_reason,
+    binding_to_id,
+    binding_to_inline_label,
+)
 from openpiano.core.normalize import clamp_int
 from openpiano.core.split import (
     SplitZone,
@@ -46,8 +53,8 @@ class MidiTrigger:
 
 @dataclass(frozen=True, slots=True)
 class SoundPreset:
-    """A stored sound: the main instrument and the keyboard split, with the MIDI key that
-    recalls it."""
+    """A stored sound: the main instrument and the keyboard split, with what recalls it: a key
+    of the MIDI keyboard, a key of the computer keyboard, or both."""
 
     stored: bool = False
     name: str = ""
@@ -57,6 +64,8 @@ class SoundPreset:
     preset: int = 0
     zones: tuple[SplitZone, ...] = field(default_factory=default_split_zones)
     trigger: MidiTrigger = field(default_factory=MidiTrigger)
+    # A key of the computer keyboard, alone or with Ctrl, Shift or Alt; None when not assigned.
+    pc_key: Binding | None = None
 
 
 def default_sound_presets() -> tuple[SoundPreset, ...]:
@@ -92,6 +101,24 @@ def normalize_trigger(value: Any) -> MidiTrigger:
     return MidiTrigger(kind=kind, channel=clamp_int(raw.get("channel"), 0, 15, default=0), number=number)
 
 
+def pc_key_refusal(binding: Binding | None) -> str | None:
+    """Why a key of the computer keyboard cannot recall a preset; None when it can."""
+    if binding is None or binding[0] != "keyboard" or not binding[1].startswith("scan:"):
+        return "This key cannot be used. Press another one."
+    return binding_reserved_reason(binding)
+
+
+def normalize_pc_key(value: Any) -> Binding | None:
+    """A computer key as stored in the settings (its text form) or as held in memory."""
+    if isinstance(value, str):
+        binding = binding_from_id(value)
+    elif isinstance(value, tuple) and len(value) == 5 and all(isinstance(part, str) for part in value[:2]):
+        binding = binding_from_id(binding_to_id(value))
+    else:
+        return None
+    return binding if pc_key_refusal(binding) is None else None
+
+
 def normalize_sound_preset(value: Any) -> SoundPreset:
     if isinstance(value, SoundPreset):
         raw: Mapping[str, Any] = {name: getattr(value, name) for name in SoundPreset.__slots__}
@@ -111,6 +138,7 @@ def normalize_sound_preset(value: Any) -> SoundPreset:
         preset=clamp_int(raw.get("preset"), INSTRUMENT_PRESET_MIN, INSTRUMENT_PRESET_MAX, default=0),
         zones=normalize_split_zones(raw.get("zones")),
         trigger=normalize_trigger(raw.get("trigger")),
+        pc_key=normalize_pc_key(raw.get("pc_key")),
     )
 
 
@@ -118,6 +146,7 @@ def normalize_sound_presets(value: Any) -> tuple[SoundPreset, ...]:
     items: Sequence[Any] = value if isinstance(value, (list, tuple)) else ()
     presets: list[SoundPreset] = []
     used: set[MidiTrigger] = set()
+    used_pc_keys: set[Binding] = set()
     for index in range(MAX_SOUND_PRESETS):
         preset = normalize_sound_preset(items[index] if index < len(items) else None)
         if preset.trigger.assigned:
@@ -126,6 +155,11 @@ def normalize_sound_presets(value: Any) -> tuple[SoundPreset, ...]:
                 preset = replace(preset, trigger=MidiTrigger())
             else:
                 used.add(preset.trigger)
+        if preset.pc_key is not None:
+            if preset.pc_key in used_pc_keys:
+                preset = replace(preset, pc_key=None)
+            else:
+                used_pc_keys.add(preset.pc_key)
         presets.append(preset)
     return tuple(presets)
 
@@ -149,6 +183,7 @@ def sound_presets_payload(presets: Iterable[SoundPreset]) -> list[dict[str, obje
                 "channel": preset.trigger.channel,
                 "number": preset.trigger.number,
             } if preset.trigger.assigned else None,
+            "pc_key": binding_to_id(preset.pc_key) if preset.pc_key is not None else None,
         })
     return payload
 
@@ -191,13 +226,26 @@ def trigger_label(trigger: MidiTrigger) -> str:
     return f"Program {trigger.number + 1} · {channel}"
 
 
+def preset_index_for_pc_key(presets: Sequence[SoundPreset], binding: Binding | None) -> int | None:
+    if binding is None:
+        return None
+    for index, preset in enumerate(presets):
+        if preset.stored and preset.pc_key == binding:
+            return index
+    return None
+
+
+def pc_key_label(binding: Binding | None) -> str:
+    return binding_to_inline_label(binding) if binding is not None else ""
+
+
 def _replace_at(presets: Sequence[SoundPreset], index: int, preset: SoundPreset) -> tuple[SoundPreset, ...]:
     return tuple(preset if position == index else item for position, item in enumerate(presets))
 
 
 def store_sound_preset(presets: Sequence[SoundPreset], index: int, *, instrument_id: str, bank: int,
                        preset: int, zones: Sequence[SplitZone], summary: str = "") -> tuple[SoundPreset, ...]:
-    """Put a sound in a slot. The slot keeps its name and its MIDI key."""
+    """Put a sound in a slot. The slot keeps its name and its keys."""
     current = normalize_sound_presets(list(presets))
     if not 0 <= int(index) < MAX_SOUND_PRESETS:
         return current
@@ -211,6 +259,7 @@ def store_sound_preset(presets: Sequence[SoundPreset], index: int, *, instrument
         preset=preset,
         zones=tuple(zones),
         trigger=previous.trigger,
+        pc_key=previous.pc_key,
     ))
     return _replace_at(current, index, stored)
 
@@ -243,6 +292,24 @@ def assign_trigger(presets: Sequence[SoundPreset], index: int, trigger: MidiTrig
             updated.append(replace(item, trigger=target))
         elif target.assigned and item.trigger == target:
             updated.append(replace(item, trigger=MidiTrigger()))
+        else:
+            updated.append(item)
+    return tuple(updated)
+
+
+def assign_pc_key(presets: Sequence[SoundPreset], index: int, binding: Binding | None) -> tuple[SoundPreset, ...]:
+    """Give a stored preset its key of the computer keyboard, taking the key away from any
+    preset that had it. None removes the preset's key."""
+    current = normalize_sound_presets(list(presets))
+    if not 0 <= int(index) < MAX_SOUND_PRESETS or not current[index].stored:
+        return current
+    target = normalize_pc_key(binding)
+    updated = []
+    for position, item in enumerate(current):
+        if position == index:
+            updated.append(replace(item, pc_key=target))
+        elif target is not None and item.pc_key == target:
+            updated.append(replace(item, pc_key=None))
         else:
             updated.append(item)
     return tuple(updated)

@@ -120,6 +120,7 @@ class PianoWidget(QWidget):
         self._show_note_labels = True
         self._mapping: dict[int, Binding | None] = {}
         self._key_labels: dict[int, str] = {}
+        self._preset_keys: frozenset[Binding] = frozenset()
         self._labels: dict[int, str] = {}
         self._notes: list[int] = []
         self._white_note_count = 0
@@ -305,10 +306,19 @@ class PianoWidget(QWidget):
 
     def refresh_key_labels(self) -> None:
         self._key_labels = {
-            note: binding_to_label(binding) if binding is not None else ""
+            note: binding_to_label(binding) if binding is not None and binding not in self._preset_keys else ""
             for note, binding in self._mapping.items()
         }
         self.update()
+
+    def set_preset_keys(self, bindings) -> None:
+        """Computer keys given to sound presets. They switch sounds instead of playing, so the
+        piano keys they belonged to do not show them."""
+        bindings = frozenset(bindings or ())
+        if bindings == self._preset_keys:
+            return
+        self._preset_keys = bindings
+        self.refresh_key_labels()
 
     def set_keybind_edit_mode(self, active: bool, selected_note: int | None = None) -> None:
         self._keybind_edit_mode = bool(active)

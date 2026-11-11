@@ -84,9 +84,13 @@ from openpiano.core.settings_store import (
 )
 from openpiano.core.sound_presets import (
     MAX_SOUND_PRESETS,
+    assign_pc_key,
     assign_trigger,
     clear_sound_preset,
     describe_sound,
+    pc_key_label,
+    pc_key_refusal,
+    preset_index_for_pc_key,
     preset_index_for_trigger,
     rename_sound_preset,
     store_sound_preset,
@@ -94,7 +98,7 @@ from openpiano.core.sound_presets import (
     trigger_label,
 )
 from openpiano.core.soundfont_keys import playable_keys, silent_notes
-from openpiano.core.split import normalize_split_zones, update_split_zone
+from openpiano.core.split import normalize_split_zones, note_name, update_split_zone
 from openpiano.core.stats_logic import collect_stats_values, trim_kps_events
 from openpiano.core.theme import apply_key_color_overrides, get_theme
 from openpiano.services.midi_routing import MidiRoutingService
@@ -115,10 +119,12 @@ from openpiano.ui.sound_presets_dialog import (
     ACTION_CANCEL_LEARN,
     ACTION_CLEAR,
     ACTION_LEARN,
+    ACTION_LEARN_PC,
     ACTION_RECALL,
     ACTION_RENAME,
     ACTION_STORE,
     ACTION_UNASSIGN,
+    ACTION_UNASSIGN_PC,
     SoundPresetRow,
 )
 from openpiano.services.update_check import UpdateCheckService, UpdateEndpoints
@@ -229,7 +235,12 @@ class PianoAppController(QObject):
         self._split_zones = settings.split_zones
         self._sound_presets = settings.sound_presets
         # The preset whose "Assign Key" is waiting for a key of the MIDI keyboard.
+        # The preset that waits for its key: one of the computer keyboard when
+        # _preset_learn_pc is set, one of the MIDI keyboard otherwise.
         self._preset_learn_index: int | None = None
+        self._preset_learn_pc = False
+        # Shown at the bottom of the Sound Presets window until the next thing done there.
+        self._preset_notice = ""
         # Plug-in settings a preset being recalled hands to the engines it makes load:
         # slot -> (instrument id, settings). Read on the audio preparation threads.
         self._staged_plugin_states: dict[str, tuple[str, bytes]] = {}
@@ -960,7 +971,7 @@ class PianoAppController(QObject):
         trigger = trigger_from_event(event.kind, event.channel, event.note, event.value)
         if trigger is not None:
             # A key given to a sound preset switches sounds and plays no note.
-            if self._preset_learn_index is not None:
+            if self._preset_learn_index is not None and not self._preset_learn_pc:
                 self._finish_preset_learn(trigger)
                 return
             preset_index = preset_index_for_trigger(self._sound_presets, trigger)
@@ -1517,22 +1528,32 @@ class PianoAppController(QObject):
     def _refresh_sound_presets_ui(self) -> None:
         rows = [
             SoundPresetRow(stored=preset.stored, name=preset.name, summary=preset.summary,
-                           key=trigger_label(preset.trigger))
+                           key=trigger_label(preset.trigger), pc_key=pc_key_label(preset.pc_key))
             for preset in self._sound_presets
         ]
-        self.window.set_sound_presets(rows, self._preset_learn_index)
+        self.window.set_sound_presets(rows, self._preset_learn_index, self._preset_learn_pc,
+                                      self._preset_notice)
+        self.window.piano_widget.set_preset_keys(
+            preset.pc_key for preset in self._sound_presets if preset.stored and preset.pc_key is not None)
+
+    def _stop_preset_learn(self) -> int | None:
+        """No preset waits for a key any more. Returns the one that did."""
+        index, self._preset_learn_index = self._preset_learn_index, None
+        self._preset_learn_pc = False
+        self._preset_notice = ""
+        return index
 
     def _on_sound_preset_action(self, action: str, index: int, text: str) -> None:
         index = int(index)
         if self._is_shutdown or not 0 <= index < MAX_SOUND_PRESETS:
             return
         if action == ACTION_CANCEL_LEARN:
-            if self._preset_learn_index is not None:
-                self._preset_learn_index = None
+            if self._stop_preset_learn() is not None:
                 self._refresh_sound_presets_ui()
             return
         if self._tutorial_active:
             return
+        self._preset_notice = ""
         if action == ACTION_STORE:
             self._store_sound_preset(index)
         elif action == ACTION_RECALL:
@@ -1543,9 +1564,19 @@ class PianoAppController(QObject):
             self._set_sound_presets(rename_sound_preset(self._sound_presets, index, text))
         elif action == ACTION_UNASSIGN:
             self._set_sound_presets(assign_trigger(self._sound_presets, index, None))
+        elif action == ACTION_UNASSIGN_PC:
+            self._set_sound_presets(assign_pc_key(self._sound_presets, index, None))
+        elif action == ACTION_LEARN_PC:
+            if not self._sound_presets[index].stored:
+                return
+            self._stop_preset_learn()
+            self._preset_learn_index = index
+            self._preset_learn_pc = True
+            self._refresh_sound_presets_ui()
         elif action == ACTION_LEARN:
             if not self._sound_presets[index].stored:
                 return
+            self._stop_preset_learn()
             self._preset_learn_index = index
             self._refresh_sound_presets_ui()
             if not self._midi_manager.current_device():
@@ -1556,7 +1587,7 @@ class PianoAppController(QObject):
 
     def _set_sound_presets(self, presets) -> None:
         if self._preset_learn_index is not None and not presets[self._preset_learn_index].stored:
-            self._preset_learn_index = None
+            self._stop_preset_learn()
         changed = presets != self._sound_presets
         self._sound_presets = presets
         self._refresh_sound_presets_ui()
@@ -1564,10 +1595,54 @@ class PianoAppController(QObject):
             self._schedule_persist()
 
     def _finish_preset_learn(self, trigger) -> None:
-        index, self._preset_learn_index = self._preset_learn_index, None
+        index = self._stop_preset_learn()
         if index is None:
             return
         self._set_sound_presets(assign_trigger(self._sound_presets, index, trigger))
+
+    def _handle_preset_learn_key(self, event: QKeyEvent) -> bool:
+        """A key of the computer keyboard pressed while a preset waits for one. Every key is
+        taken here, whichever window of OpenPiano it was pressed in."""
+        if event.isAutoRepeat():
+            return True
+        key = int(event.key())
+        if key == int(Qt.Key.Key_Escape):
+            self._stop_preset_learn()
+            self._refresh_sound_presets_ui()
+            return True
+        if key in {int(Qt.Key.Key_Control), int(Qt.Key.Key_Shift), int(Qt.Key.Key_Alt),
+                   int(Qt.Key.Key_AltGr), int(Qt.Key.Key_Meta)}:
+            # Held for a combination: the key it goes with is still to come.
+            return True
+        binding = self._binding_from_key_event(event)
+        reason = pc_key_refusal(binding)
+        if reason:
+            self._preset_notice = reason
+            self._refresh_sound_presets_ui()
+            return True
+        index = self._stop_preset_learn()
+        if index is None:
+            return True
+        presets = assign_pc_key(self._sound_presets, index, binding)
+        if presets[index].pc_key == binding:
+            self._preset_notice = f"“{pc_key_label(binding)}” now recalls “{presets[index].name}”."
+            notes = self._binding_to_notes.get(binding, ())
+            if notes:
+                # Nearly every key of the computer keyboard plays a note until it is given away.
+                self._preset_notice += f" It no longer plays {note_name(notes[0])}."
+        self._set_sound_presets(presets)
+        return True
+
+    def _recall_preset_for_key_event(self, event: QKeyEvent) -> bool:
+        """Recall the preset a key of the computer keyboard was given to. True when the key
+        belongs to a preset: it then switches sounds and plays no note."""
+        binding = self._binding_from_key_event(event)
+        index = preset_index_for_pc_key(self._sound_presets, binding)
+        if index is None:
+            return False
+        if not event.isAutoRepeat():
+            self._recall_sound_preset(index)
+        return True
 
     def _instrument_display_name(self, instrument_id: str) -> str:
         instrument = self._instrument_by_id.get(instrument_id)
@@ -2094,6 +2169,9 @@ class PianoAppController(QObject):
                 f"{note_label}: the older binding could not be matched to a physical key. Press a new combination, or Delete to clear it.",
             )
             return
+        preset_index = preset_index_for_pc_key(self._sound_presets, binding)
+        if preset_index is not None:
+            binding_label += f" (recalls the sound preset “{self._sound_presets[preset_index].name}” instead)"
         self._set_keybind_editor_status(
             f"{note_label} selected. Press a combination to assign, or Delete to clear. Current: {binding_label}",
         )
@@ -2590,7 +2668,7 @@ class PianoAppController(QObject):
         self._window_y = defaults.window_y
         self._split_zones = defaults.split_zones
         # Stored sound presets are kept: they are the user's work, not a setting.
-        self._preset_learn_index = None
+        self._stop_preset_learn()
         self._staged_plugin_states.clear()
         self._pending_plugin_instrument_id = ""
         self._default_keybind_map_full = build_default_keybind_map_full()
@@ -2766,11 +2844,18 @@ class PianoAppController(QObject):
                     return True
 
         if event.type() == QEvent.KeyPress:
+            if (self._preset_learn_index is not None and self._preset_learn_pc and isinstance(event, QKeyEvent)
+                    and QApplication.activeModalWidget() is None and QApplication.activePopupWidget() is None):
+                return self._handle_preset_learn_key(event)
             if not self._is_main_window_key_context(watched):
                 return super().eventFilter(watched, event)
             key_event = event                            
             if isinstance(key_event, QKeyEvent):
                 if not self._should_route_piano_key_event(key_event):
+                    # The Sound Presets window in front: its keys still recall their presets.
+                    if (self.window.sound_presets_window_active() and not self._keybind_edit_active
+                            and self._recall_preset_for_key_event(key_event)):
+                        return True
                     return super().eventFilter(watched, event)
                 return self._handle_key_press_event(key_event)
         if event.type() == QEvent.KeyRelease:
@@ -2819,6 +2904,13 @@ class PianoAppController(QObject):
             if reserved:
                 self._set_keybind_editor_status(reserved)
                 return True
+            preset_index = preset_index_for_pc_key(self._sound_presets, binding)
+            if preset_index is not None:
+                # It would never play: the preset takes the key before the note does.
+                self._set_keybind_editor_status(
+                    f"This key recalls the sound preset “{self._sound_presets[preset_index].name}”. "
+                    "Take it away from the preset first: Sound Presets, × next to its PC key.")
+                return True
             if self._keybind_selected_note is None:
                 self._set_keybind_editor_status("Select a piano key first, then press a combination.")
                 return True
@@ -2857,6 +2949,8 @@ class PianoAppController(QObject):
         binding = self._binding_from_key_event(event)
         if binding is None:
             return False
+        if self._recall_preset_for_key_event(event):
+            return True
         if event.isAutoRepeat():
             return True
         keycodes = self._event_keycodes(event)
@@ -3585,6 +3679,8 @@ class PianoAppController(QObject):
         if self._is_shutdown or not refresh_keyboard_labels():
             return
         self.window.piano_widget.refresh_key_labels()
+        # The computer keys of the sound presets are named after what is printed on them.
+        self._refresh_sound_presets_ui()
         if self._keybind_edit_active and self._keybind_selected_note is not None:
             self._on_keybind_note_selected(self._keybind_selected_note)
 
