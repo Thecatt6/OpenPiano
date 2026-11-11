@@ -88,13 +88,20 @@ OpenPiano includes Default and Grand Piano SoundFonts, listed as **OpenPiano Bui
 
 Use **Controls** to select the instrument. A SoundFont file holds many sounds: **Bank** is the group of sounds inside the file and **Preset** is the sound itself. Adjust volume, note strength, sustain and pitch in **Settings > Sound**.
 
-Some sounds do not cover the whole keyboard: a flute has no low notes, a drum kit has gaps. When a SoundFont sound is loaded or its preset changes, OpenPiano reads from the file which keys the sound can play and draws the others in gray. A gray key can still be pressed, it just makes no sound. The same is shown for the SoundFont of each split zone, taking its octave shift into account. Keys played by a VST3 plug-in are never gray, because a plug-in does not say which notes it can play.
+Some sounds do not cover the whole keyboard: a flute has no low notes, a drum kit has gaps. When a SoundFont sound is loaded or its preset changes, OpenPiano reads from the file which keys the sound can play and draws the others in gray. A gray key can still be pressed, it just makes no sound. The same is shown for the SoundFont of each split zone, taking its octave shift into account. A VST3 plug-in does not say which notes it can play, so for a plug-in the silent keys have to be looked for with **Find Silent Keys** (see below).
 
 ### Play VST3 instrument plug-ins
 
 OpenPiano looks for VST3 instrument plug-ins each time it starts and adds the ones it finds to the instrument list in **Controls**, marked **VST3 Plug-in**. It searches the standard Windows locations (`C:\Program Files\Common Files\VST3` and `%LOCALAPPDATA%\Programs\Common\VST3`) and `%LOCALAPPDATA%\OpenPiano\plugins`. Add more locations with **Settings > Plug-ins (VST3) > Plug-in Folders…**, and use **Rescan Plug-ins** after installing a new plug-in while OpenPiano is open.
 
 Select a plug-in like any other instrument. Plug-ins do not use banks and presets, so while one is selected those two lists are replaced by the **Open Plug-in Window** button: the sounds are chosen in the plug-in's own window. OpenPiano remembers what you set there for the next session.
+
+A plug-in cannot tell OpenPiano which keys its sound covers. To have the silent keys drawn in gray, as for a SoundFont, click **Find Silent Keys**, next to **Open Plug-in Window** and in **Settings > Plug-ins (VST3)**. OpenPiano then plays every key of the plug-ins in use, the main instrument and the split zones, with their sound switched off, and marks the keys that give nothing. This takes a few seconds; a plug-in that is slow to answer is given about 20 seconds, and what was found by then is kept. The plug-ins are not heard meanwhile.
+
+- Do it once the plug-in has finished loading its sound. A sample library that is still loading gives no sound yet.
+- The result belongs to the sound the plug-in has at that moment and is remembered for it, so the gray keys come back by themselves when that same sound is loaded again, at the next start or from a sound preset. After you change the sound in the plug-in's window the keys go back to normal until you click **Find Silent Keys** again.
+- A key is only drawn in gray when it clearly gave no sound. Keys that could not be told apart from notes still ringing, which happens with sounds that fade slowly, stay normal; the message at the end says how many.
+- An instrument with keyswitches (silent keys that change the playing style) has them pressed during the search. OpenPiano presses the lowest one last, which is usually the normal style; if the plug-in ends up on another style, choose it again in its window.
 
 Each plug-in is checked in a separate helper process, so a plug-in that crashes or hangs while being checked is left out of the list instead of closing OpenPiano. If OpenPiano closes unexpectedly while it is loading a plug-in, it starts with a built-in sound the next time and tells you which plug-in was skipped.
 

@@ -77,11 +77,13 @@ from openpiano.ui.piano_widget import PianoWidget
 from openpiano.ui.plugin_folders_dialog import PluginDetailsDialog, PluginFoldersDialog
 from openpiano.ui.sound_presets_dialog import SoundPresetRow, SoundPresetsDialog
 from openpiano.ui.split_panel import (
-    ElidedLabel,
+    KEY_SCAN_TEXT,
+    KEY_SCAN_TOOLTIP,
     PluginCardControls,
     configure_split_grid,
     create_split_card,
     other_zone_ranges,
+    show_key_scan_state,
 )
 from openpiano.ui.spotlight_overlay import SpotlightOverlay
 from openpiano.ui.stats_bar import StatsBar
@@ -114,8 +116,8 @@ PIANO_STYLE_LABELS = {
 FOOTER_ICON_SIZE = 18
 # Height of the Keyboard Split drawer before its contents have been measured.
 SPLIT_PANEL_HEIGHT_GUESS = 170
-PLUGIN_SOUND_HINT = "Choose the sound in the plug-in's own window."
-PLUGIN_SOUND_TOOLTIP = ("Bank and Preset pick a sound inside a SoundFont. A plug-in has no such lists: "
+PLUGIN_SOUND_TOOLTIP = ("Open the plug-in's own window to choose and adjust its sound.\n"
+                        "Bank and Preset pick a sound inside a SoundFont. A plug-in has no such lists:\n"
                         "its sounds are chosen in its own window.")
 
 
@@ -171,6 +173,7 @@ class MainWindow(QMainWindow):
     pluginRescanRequested = Signal()
     pluginFoldersRequested = Signal()
     pluginEditorRequested = Signal(int)
+    pluginKeyScanRequested = Signal()
     soundPresetAction = Signal(str, int, str)
 
     def __init__(self, theme: ThemePalette, icon_path: Path | None = None) -> None:
@@ -491,6 +494,7 @@ class MainWindow(QMainWindow):
         self.plugin_controls.foldersRequested.connect(self.pluginFoldersRequested.emit)
         self.plugin_controls.editorRequested.connect(lambda: self.pluginEditorRequested.emit(-1))
         self.plugin_controls.detailsRequested.connect(self.show_plugin_details)
+        self.plugin_controls.keyScanRequested.connect(self.pluginKeyScanRequested.emit)
 
         self.interface_card, interface_layout = self._create_section_card("Interface", self.settings_body)
         layout.addWidget(self.interface_card)
@@ -734,14 +738,17 @@ class MainWindow(QMainWindow):
         plugin_sound_layout.setSpacing(self._sp(8))
         self.plugin_window_button = QPushButton("Open Plug-in Window", self.plugin_sound_row)
         self.plugin_window_button.setObjectName("actionButton")
-        self.plugin_window_button.setToolTip("Open the plug-in's own window to choose and adjust its sound.")
+        self.plugin_window_button.setToolTip(PLUGIN_SOUND_TOOLTIP)
         self.plugin_window_button.setEnabled(False)
         self.plugin_window_button.clicked.connect(lambda: self.pluginEditorRequested.emit(-1))
-        self.plugin_sound_hint = ElidedLabel(self.plugin_sound_row)
-        self.plugin_sound_hint.setObjectName("settingHint")
-        self.plugin_sound_hint.set_full_text(PLUGIN_SOUND_HINT, PLUGIN_SOUND_TOOLTIP)
+        self.plugin_keys_button = QPushButton(KEY_SCAN_TEXT, self.plugin_sound_row)
+        self.plugin_keys_button.setObjectName("actionButton")
+        self.plugin_keys_button.setToolTip(KEY_SCAN_TOOLTIP)
+        self.plugin_keys_button.setEnabled(False)
+        self.plugin_keys_button.clicked.connect(self.pluginKeyScanRequested.emit)
         plugin_sound_layout.addWidget(self.plugin_window_button)
-        plugin_sound_layout.addWidget(self.plugin_sound_hint, 1)
+        plugin_sound_layout.addWidget(self.plugin_keys_button)
+        plugin_sound_layout.addStretch(1)
         self.plugin_sound_row.hide()
 
         midi_label = QLabel("MIDI In", self.controls_card)
@@ -940,6 +947,7 @@ class MainWindow(QMainWindow):
                                + self.bank_combo.minimumWidth())
         width = max(all_notes_width, self.plugin_window_button.sizeHint().width())
         self.plugin_window_button.setFixedSize(width, self.instrument_combo.sizeHint().height())
+        self.plugin_keys_button.setFixedHeight(self.instrument_combo.sizeHint().height())
         if self._plugin_sound_mode:
             self.all_notes_off_button.setMinimumWidth(width)
             self.all_notes_off_button.setMaximumWidth(width)
@@ -2676,6 +2684,11 @@ class MainWindow(QMainWindow):
         self._plugin_editor_available = bool(available)
         self.plugin_controls.set_editor_available(available)
         self.plugin_window_button.setEnabled(self._plugin_editor_available and not self._audio_loading)
+
+    def set_plugin_key_scan_state(self, available: bool, scanning: bool) -> None:
+        """The Find Silent Keys buttons: offered while a plug-in is in use, busy during a scan."""
+        self.plugin_controls.set_key_scan_state(available, scanning)
+        show_key_scan_state(self.plugin_keys_button, available, scanning)
 
     def show_plugin_details(self) -> None:
         dialog = PluginDetailsDialog(self, self.theme, self.plugin_controls.report_text())

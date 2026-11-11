@@ -23,6 +23,8 @@ PLUGIN_LOAD_GUARD_FILE_NAME = "plugin_loading.json"
 _FLOAT_SIZE = ctypes.sizeof(ctypes.c_float)
 _MIDI_QUEUE_LIMIT = 4096
 _EDITOR_CLOSE_TIMEOUT = 10.0
+# How long a key scan on another thread is given to leave the plug-in before it is freed.
+_SCAN_STOP_TIMEOUT = 5.0
 _RELEASE_TIMEOUT = 20.0
 
 # Plug-ins must be destroyed on the thread that created them. One that cannot be handed back
@@ -223,6 +225,8 @@ class PluginAudioEngine:
         self._editor_signal: _EditorCloseSignal | None = None
         self._editor_active = False
         self._release_pending = False
+        # Set while find_silent_keys plays the keys itself; keys pressed then are dropped.
+        self._scan_stop: threading.Event | None = None
 
     @property
     def plugin_name(self) -> str:
@@ -336,12 +340,69 @@ class PluginAudioEngine:
         if plugin is None or self._closed or not data or not self._invoker.is_main_thread():
             return False
         self.all_notes_off()
+        self.stop_key_scan()
         try:
             with self._state_lock:
                 plugin.raw_state = bytes(data)
         except Exception:
             return False
         return True
+
+    @property
+    def key_scan_running(self) -> bool:
+        return self._scan_stop is not None
+
+    def stop_key_scan(self) -> None:
+        stop = self._scan_stop
+        if stop is not None:
+            stop.set()
+
+    def find_silent_keys(self, notes, *, cancel: threading.Event | None = None):
+        """Play each of the notes into the plug-in and return which gave no sound (a
+        KeyScanResult); None when that cannot be told. Any thread but the audio thread, and not
+        while the plug-in window is open. The plug-in is not heard meanwhile: the audio thread
+        plays silence for as long as this holds the lock, and keys pressed are dropped."""
+        from openpiano.core.plugin_keys import find_silent_notes
+
+        if self._plugin is None or self._closed or self._editor_active or self._scan_stop is not None:
+            return None
+        stop = threading.Event()
+        self._scan_stop = stop
+        try:
+            with self._state_lock:
+                plugin = self._plugin
+                if plugin is None or self._closed:
+                    return None
+                import numpy
+
+                channels = self._channels
+
+                def render(events, frames: int) -> float:
+                    audio = self._render_plugin(plugin, [(bytes(event), 0.0) for event in events], frames, channels)
+                    if not audio.size:
+                        return 0.0
+                    # What is not a number is silence to the listener too: render_into zeroes it.
+                    return float(numpy.nan_to_num(numpy.abs(audio), nan=0.0, posinf=0.0).max())
+
+                # What was played up to now reaches the plug-in first, the note-offs above all:
+                # a note left sounding would cover every key that is tried.
+                waiting = [event for event, _time in self._drain_midi()]
+                held = sorted(self._active_notes)
+                self._active_notes.clear()
+                if waiting:
+                    render(waiting, 64)
+                if held:
+                    render([bytes((0x80, note, 0)) for note in held], 64)
+                return find_silent_notes(
+                    render, notes, self.sample_rate,
+                    cancelled=lambda: self._closed or stop.is_set() or (cancel is not None and cancel.is_set()))
+        except Exception:
+            # The plug-in failed while it was played: nothing can be said about its keys.
+            return None
+        finally:
+            self._midi.clear()
+            self._active_notes.clear()
+            self._scan_stop = None
 
     def select_program(self, bank: int = 0, preset: int = 0) -> None:
         return
@@ -356,7 +417,7 @@ class PluginAudioEngine:
         return 0, 0
 
     def note_on(self, midi_note: int, velocity: int = 100) -> None:
-        if self._plugin is None or self._closed:
+        if self._plugin is None or self._closed or self._scan_stop is not None:
             return
         note = clamp_int(midi_note, 0, 127, default=0)
         if note in self._active_notes:
@@ -479,7 +540,7 @@ class PluginAudioEngine:
         plugin = self._plugin
         if plugin is None or self._closed:
             raise RuntimeError("The plug-in is not loaded.")
-        if self._editor_active:
+        if self._editor_active or self._scan_stop is not None:
             return False
         signal = _EditorCloseSignal(on_poll)
         self._editor_signal = signal
@@ -501,7 +562,18 @@ class PluginAudioEngine:
             signal.set()
 
     def _release_on_main(self) -> None:
-        plugin, self._plugin = self._plugin, None
+        # A key scan on another thread may be inside the plug-in. It stops at its next block,
+        # the engine being closed by now; a plug-in it does not come out of cannot be freed.
+        self.stop_key_scan()
+        if not self._state_lock.acquire(timeout=_SCAN_STOP_TIMEOUT):
+            if self._plugin is not None:
+                _orphaned_plugins.append(self._plugin)
+                self._plugin = None
+            return
+        try:
+            plugin, self._plugin = self._plugin, None
+        finally:
+            self._state_lock.release()
         if plugin is None:
             return
         self._save_state(plugin)

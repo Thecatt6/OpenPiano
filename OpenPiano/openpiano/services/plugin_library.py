@@ -17,6 +17,7 @@ from openpiano.core.plugin_host import (
     PluginLoadGuard,
     PluginStateStore,
 )
+from openpiano.core.plugin_keys import PLUGIN_SILENT_KEYS_FILE_NAME, PluginKeyStore
 from openpiano.core.plugin_registry import (
     PLUGIN_CACHE_FILE_NAME,
     PluginInfo,
@@ -54,6 +55,7 @@ class PluginLibrary(QObject):
         self.cache_path = self.data_dir / PLUGIN_CACHE_FILE_NAME
         self.state_store = PluginStateStore(self.data_dir / PLUGIN_STATE_DIR_NAME)
         self.load_guard = PluginLoadGuard(self.data_dir / PLUGIN_LOAD_GUARD_FILE_NAME)
+        self.key_store = PluginKeyStore(self.data_dir / PLUGIN_SILENT_KEYS_FILE_NAME)
         self.available = plugin_support_available() if available is None else bool(available)
         self._scanner = scanner
         self._folders = self._clean_folders(folders)

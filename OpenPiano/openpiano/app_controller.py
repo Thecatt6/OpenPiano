@@ -70,6 +70,7 @@ from openpiano.core.midi_input import MidiInputEvent, MidiInputManager
 from openpiano.core.midi_recording import MidiRecorder
 from openpiano.core.piano_pedal import PedalState
 from openpiano.core.plugin_host import PluginAudioEngine
+from openpiano.core.plugin_keys import notes_to_scan
 from openpiano.core.plugin_registry import is_plugin_instrument_id
 from openpiano.core.plugin_window import PluginWindowPlacer
 from openpiano.core.object_tree import is_descendant_of
@@ -150,6 +151,7 @@ class PianoAppController(QObject):
     _recordingSaveReady = Signal(object)
     _pianoDownloadProgressReady = Signal(int, int)
     _pianoDownloadReady = Signal(object)
+    _pluginKeyScanReady = Signal(object)
 
     def __init__(
         self,
@@ -181,6 +183,14 @@ class PianoAppController(QObject):
         self._piano_download_installed = False
         self._pianoDownloadProgressReady.connect(self._on_piano_download_progress, Qt.ConnectionType.QueuedConnection)
         self._pianoDownloadReady.connect(self._finish_piano_download, Qt.ConnectionType.QueuedConnection)
+        # The silent keys known for each plug-in in use, by slot (-1 the main instrument, else
+        # the zone): the engine and the notes they were looked up for, and None when unknown.
+        self._plugin_key_cache: dict[int, tuple[object, range, frozenset[int] | None]] = {}
+        self._key_scan_stop: threading.Event | None = None
+        self._key_scan_jobs: list[tuple] = []
+        # Plug-ins whose sound was changed while their keys were being tried.
+        self._key_scan_outdated: set[int] = set()
+        self._pluginKeyScanReady.connect(self._finish_plugin_key_scan, Qt.ConnectionType.QueuedConnection)
         self._settings_save_error_shown = False
 
         report_startup("Loading saved preferences...")
@@ -480,6 +490,7 @@ class PianoAppController(QObject):
         self.window.soundPresetAction.connect(self._on_sound_preset_action)
         # Queued: the plug-in window keeps this slot busy for as long as it stays open.
         self.window.pluginEditorRequested.connect(self._on_plugin_editor_requested, Qt.ConnectionType.QueuedConnection)
+        self.window.pluginKeyScanRequested.connect(self._on_plugin_key_scan_requested)
 
         self.window.piano_widget.notePressed.connect(self._on_mouse_note_pressed)
         self.window.piano_widget.noteReleased.connect(self._on_mouse_note_released)
@@ -1270,24 +1281,180 @@ class PianoAppController(QObject):
         return True
 
     def _playable_keys_of(self, instrument_id: str, bank: int, preset: int) -> frozenset[int] | None:
-        """The notes a SoundFont instrument can play. None for a plug-in: its range cannot be read."""
+        """The notes a SoundFont instrument can play. None for a plug-in: its range cannot be
+        read, only found by playing it (_plugin_playable_keys)."""
         instrument = self._instrument_by_id.get(instrument_id)
         if instrument is None or instrument.source == "plugin" or is_plugin_instrument_id(instrument_id):
             return None
         return playable_keys(instrument.path, bank, preset)
 
+    def _plugin_key_slots(self) -> list[tuple[int, object, str, range]]:
+        """The plug-ins that are playing: slot (-1 the main instrument, else the zone), engine,
+        instrument and the notes the keyboard reaches in it."""
+        slots: list[tuple[int, object, str, range]] = []
+        if (self.audio_available and self._instrument_id
+                and callable(getattr(self.audio_engine, 'find_silent_keys', None))):
+            slots.append((-1, self.audio_engine, self._instrument_id, notes_to_scan()))
+        for index, zone in enumerate(self._split_zones):
+            state = self._split_manager.state(index)
+            if not (zone.enabled and state.status == "ready" and state.instrument_id == zone.instrument_id):
+                continue
+            engine = self._split_manager.engine(index)
+            if callable(getattr(engine, 'find_silent_keys', None)):
+                slots.append((index, engine, state.instrument_id, notes_to_scan(zone.octave)))
+        return slots
+
+    def _plugin_playable_keys(self, index: int, engine, instrument_id: str, notes: range) -> frozenset[int] | None:
+        """The notes a plug-in plays, when its keys have been tried with the sound it has now."""
+        cached = self._plugin_key_cache.get(index)
+        if cached is None or cached[0] is not engine or cached[1] != notes:
+            silent = None
+            store = getattr(self._plugin_library, 'key_store', None)
+            capture = getattr(engine, 'capture_state', None)
+            if store is not None and callable(capture) and not getattr(engine, 'key_scan_running', False):
+                try:
+                    silent = store.get(instrument_id, capture(), notes)
+                except Exception:
+                    silent = None
+            cached = (engine, notes, silent)
+            self._plugin_key_cache[index] = cached
+        silent = cached[2]
+        return None if silent is None else frozenset(range(128)) - silent
+
+    def _forget_plugin_keys(self, engine) -> None:
+        """The sound of this plug-in may have changed: what was known of its keys is looked up again."""
+        for index in [index for index, cached in self._plugin_key_cache.items() if cached[0] is engine]:
+            del self._plugin_key_cache[index]
+        if self._key_scan_stop is not None:
+            self._key_scan_outdated.add(id(engine))
+
     def _refresh_silent_keys(self) -> None:
         """Shows in gray the keys that the main sound and the split zones cannot play."""
+        plugins = {index: slot for index, *slot in self._plugin_key_slots()}
+        for index in [index for index in self._plugin_key_cache if index not in plugins]:
+            del self._plugin_key_cache[index]
         main_keys = None
-        if self.audio_available and self._instrument_id:
+        if -1 in plugins:
+            main_keys = self._plugin_playable_keys(-1, *plugins[-1])
+        elif self.audio_available and self._instrument_id:
             main_keys = self._playable_keys_of(self._instrument_id, self._instrument_bank, self._instrument_preset)
         zone_keys: list[frozenset[int] | None] = []
         for index, zone in enumerate(self._split_zones):
             state = self._split_manager.state(index)
+            if index in plugins:
+                zone_keys.append(self._plugin_playable_keys(index, *plugins[index]))
+                continue
             loaded = (zone.enabled and state.status == "ready" and not state.is_plugin
                       and state.instrument_id == zone.instrument_id)
             zone_keys.append(self._playable_keys_of(state.instrument_id, state.bank, state.preset) if loaded else None)
         self.window.piano_widget.set_silent_notes(silent_notes(main_keys, self._split_zones, zone_keys))
+        self.window.set_plugin_key_scan_state(bool(plugins), self._key_scan_stop is not None)
+
+    def _plugin_slot_name(self, index: int, engine) -> str:
+        name = str(getattr(engine, 'plugin_name', '') or '').strip() or "Plug-in"
+        return f"{name} (main instrument)" if index < 0 else f"{name} (zone {index + 1})"
+
+    def _on_plugin_key_scan_requested(self) -> None:
+        """Find Silent Keys: try every key of the plug-ins in use and show the silent ones in gray."""
+        if self._is_shutdown or self._key_scan_stop is not None:
+            return
+        slots = self._plugin_key_slots()
+        if not slots:
+            self.window.show_info(
+                "Find Silent Keys",
+                "No plug-in is playing right now.\n\n"
+                "The keys a SoundFont cannot play are shown in gray by themselves.")
+            return
+        if any(getattr(engine, 'editor_open', False) for _index, engine, _id, _notes in slots):
+            self.window.show_info("Find Silent Keys", "Close the plug-in's window first, then try again.")
+            return
+        self._stop_all_notes(preserve_pedal=True)
+        jobs = []
+        for index, engine, instrument_id, notes in slots:
+            capture = getattr(engine, 'capture_state', None)
+            jobs.append((index, engine, instrument_id, notes, capture() if callable(capture) else None))
+        stop = threading.Event()
+        self._key_scan_stop = stop
+        self._key_scan_jobs = jobs
+        self._key_scan_outdated = set()
+        self.window.set_plugin_key_scan_state(True, True)
+        threading.Thread(target=self._run_plugin_key_scan, args=(jobs, stop),
+                         name="plugin-key-scan", daemon=True).start()
+
+    def _run_plugin_key_scan(self, jobs: list[tuple], stop: threading.Event) -> None:
+        results = []
+        for index, engine, instrument_id, notes, before in jobs:
+            found = None
+            if not stop.is_set():
+                try:
+                    found = engine.find_silent_keys(notes, cancel=stop)
+                except Exception:
+                    found = None
+            results.append((index, engine, instrument_id, notes, before, found))
+        try:
+            self._pluginKeyScanReady.emit((stop, results))
+        except RuntimeError:
+            # The application is gone.
+            pass
+
+    def _cancel_plugin_key_scan(self) -> None:
+        stop, self._key_scan_stop = self._key_scan_stop, None
+        jobs, self._key_scan_jobs = self._key_scan_jobs, []
+        if stop is None:
+            return
+        stop.set()
+        for _index, engine, *_rest in jobs:
+            stopper = getattr(engine, 'stop_key_scan', None)
+            if callable(stopper):
+                stopper()
+
+    def _finish_plugin_key_scan(self, payload: object) -> None:
+        stop, results = payload
+        if stop is not self._key_scan_stop:
+            return
+        self._key_scan_stop = None
+        self._key_scan_jobs = []
+        outdated, self._key_scan_outdated = self._key_scan_outdated, set()
+        if self._is_shutdown:
+            return
+        store = getattr(self._plugin_library, 'key_store', None)
+        playing = {id(engine): (index, notes) for index, engine, _id, notes in self._plugin_key_slots()}
+        lines: list[str] = []
+        for index, engine, instrument_id, notes, before, found in results:
+            name = self._plugin_slot_name(index, engine)
+            if playing.get(id(engine)) != (index, notes) or id(engine) in outdated:
+                # What is remembered for the sound it has now is looked up again below.
+                self._plugin_key_cache.pop(index, None)
+                lines.append(f"{name}: its sound or its zone was changed meanwhile, so the result was dropped.")
+                continue
+            if found is None:
+                self._plugin_key_cache.pop(index, None)
+                lines.append(f"{name}: no key gave any sound, so nothing new is known. "
+                             "If the plug-in was still loading its sounds, try again when it is ready.")
+                continue
+            capture = getattr(engine, 'capture_state', None)
+            after = capture() if callable(capture) else None
+            if store is not None:
+                # Filed under the settings before and after: playing the keys can change them.
+                for state in dict.fromkeys((before, after)):
+                    try:
+                        store.put(instrument_id, state, notes, found.silent)
+                    except Exception:
+                        pass
+            self._plugin_key_cache[index] = (engine, notes, found.silent)
+            count, tried = len(found.silent), len(notes)
+            if count:
+                line = f"{name}: {count} of the {tried} keys tried give{'s' if count == 1 else ''} no sound."
+            elif found.undecided:
+                line = f"{name}: none of the {tried} keys tried is known to be silent."
+            else:
+                line = f"{name}: all {tried} keys tried give sound."
+            if found.undecided:
+                line += (f" {found.undecided}{' more' if count else ''} could not be told apart from notes"
+                         " still ringing and are shown as playing.")
+            lines.append(line)
+        self._refresh_silent_keys()
+        self.window.show_info("Find Silent Keys", "\n\n".join(lines))
 
     def _configure_split_zones(self) -> None:
         self.window.set_split_zones(self._split_zones)
@@ -1480,6 +1647,8 @@ class PianoAppController(QObject):
             loader(data)
         except Exception as exc:
             _ = exc
+        self._forget_plugin_keys(engine)
+        self._refresh_silent_keys()
 
     def _store_sound_preset(self, index: int) -> None:
         if self._audio_request is not None or self._audio_handoff:
@@ -1634,6 +1803,10 @@ class PianoAppController(QObject):
         opener = getattr(engine, 'open_editor', None)
         if not callable(opener) or getattr(engine, 'editor_open', False):
             return
+        if getattr(engine, 'key_scan_running', False):
+            self.window.show_info("Plug-in", "The keys of this plug-in are being tried right now. "
+                                             "Open its window when that has finished.")
+            return
         # The plug-in window runs its own loop until it is closed. On Windows that loop also
         # serves this application; elsewhere it has to be kept alive from here.
         keep_alive = None if sys.platform == 'win32' else QApplication.processEvents
@@ -1651,6 +1824,11 @@ class PianoAppController(QObject):
         except Exception as exc:
             if not self._is_shutdown:
                 self.window.show_warning("Plug-in", f"The plug-in window could not be opened.\n\n{exc}")
+        if not self._is_shutdown:
+            # The sound may have been changed in the window: its silent keys are known only if
+            # they were found for these settings before.
+            self._forget_plugin_keys(engine)
+            self._refresh_silent_keys()
 
     def _plugin_window_title(self, engine, index: int) -> str:
         name = str(getattr(engine, 'plugin_name', '') or '').strip() or "Plug-in"
@@ -3725,6 +3903,7 @@ class PianoAppController(QObject):
         self._update_stop_event.set()
         self._recording_save_stop_event.set()
         self._piano_download_stop.set()
+        self._cancel_plugin_key_scan()
         self._piano_download_active = False
         self._midi_dropdown_refresh_active = False
         self._recording_save_active = False
