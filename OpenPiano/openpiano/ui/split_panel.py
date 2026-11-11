@@ -397,12 +397,33 @@ def create_split_card(
     return zones, hint, grid
 
 
+KEY_SCAN_TEXT = "Find Silent Keys"
+KEY_SCAN_BUSY_TEXT = "Finding…"
+KEY_SCAN_TOOLTIP = (
+    "A plug-in does not say which keys it can play. This plays every key of the plug-ins in use,\n"
+    "the main instrument and the split zones, with their sound switched off, and shows in gray\n"
+    "the keys that stay silent. The plug-ins are not heard for a few seconds meanwhile.\n"
+    "The result is remembered until the sound is changed in the plug-in's window.")
+
+
+def show_key_scan_state(button: QPushButton, available: bool, scanning: bool) -> None:
+    """A Find Silent Keys button: offered while a plug-in is playing, busy during a scan."""
+    if scanning and button.text() != KEY_SCAN_BUSY_TEXT:
+        # The shorter text must not make the button jump.
+        button.setMinimumWidth(button.width())
+    elif not scanning:
+        button.setMinimumWidth(0)
+    button.setText(KEY_SCAN_BUSY_TEXT if scanning else KEY_SCAN_TEXT)
+    button.setEnabled(bool(available) and not scanning)
+
+
 class PluginCardControls(QObject):
 
     rescanRequested = Signal()
     foldersRequested = Signal()
     editorRequested = Signal()
     detailsRequested = Signal()
+    keyScanRequested = Signal()
 
     def __init__(self, card: QWidget, card_layout: QVBoxLayout) -> None:
         super().__init__(card)
@@ -434,7 +455,13 @@ class PluginCardControls(QObject):
         button_row.addWidget(self.rescan_button)
         button_row.addWidget(self.folders_button)
         button_row.addWidget(self.details_button)
+        self.key_scan_button = QPushButton(KEY_SCAN_TEXT, card)
+        self.key_scan_button.setObjectName("actionButton")
+        self.key_scan_button.setToolTip(KEY_SCAN_TOOLTIP)
+        self.key_scan_button.clicked.connect(self.keyScanRequested.emit)
+        self.key_scan_button.setEnabled(False)
         button_row.addWidget(self.editor_button)
+        button_row.addWidget(self.key_scan_button)
         button_row.addStretch(1)
         card_layout.addLayout(button_row)
         self._details = ""
@@ -453,3 +480,6 @@ class PluginCardControls(QObject):
 
     def set_editor_available(self, available: bool) -> None:
         self.editor_button.setEnabled(bool(available))
+
+    def set_key_scan_state(self, available: bool, scanning: bool) -> None:
+        show_key_scan_state(self.key_scan_button, available, scanning)

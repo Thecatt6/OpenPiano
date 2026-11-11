@@ -5,10 +5,15 @@ import sys
 import threading
 
 from openpiano.core.fluidsynth_loader import candidate_dll_dirs
+from openpiano.core.audio_errors import AudioOutputError
 
 _dll = None
 _checked = False
 _initialization_lock = threading.Lock()
+# The audio helper opens one output at a time and refuses a second open that overlaps the first
+# (ERROR_BUSY). Split zones and plug-ins each open their own output from their own thread,
+# so the opens are queued here.
+_wasapi_open_lock = threading.Lock()
 
 
 def native_audio_library():
@@ -96,10 +101,11 @@ class NativeWasapiDriver:
         if not configure_wasapi(self.dll):
             raise RuntimeError('Event-driven WASAPI is unavailable in this audio helper.')
         error = ctypes.c_int32()
-        self.pointer = self.dll.op_wasapi_open(limiter.pointer, sample_rate, periods, device_id,
-                                               int(getattr(limiter, '_diagnostic', False)), ctypes.byref(error))
+        with _wasapi_open_lock:
+            self.pointer = self.dll.op_wasapi_open(limiter.pointer, sample_rate, periods, device_id,
+                                                   int(getattr(limiter, '_diagnostic', False)), ctypes.byref(error))
         if not self.pointer:
-            raise RuntimeError(f'Could not start event-driven WASAPI (0x{error.value & 0xffffffff:08X}).')
+            raise AudioOutputError('Could not start event-driven WASAPI', error.value)
 
     def statistics(self) -> dict[str, int | float]:
         values = (ctypes.c_int64 * 16)()

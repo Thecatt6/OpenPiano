@@ -29,15 +29,28 @@ from openpiano.core.config import (
     normalize_piano_style,
     normalize_ui_scale,
 )
-from openpiano.core.keymap import MIDI_END_88, MIDI_START_88, PianoMode, binding_from_id, binding_to_id
+from openpiano.core.keymap import (
+    KEYBIND_SCHEMA_VERSION,
+    MIDI_END_88,
+    MIDI_START_88,
+    PianoMode,
+    binding_from_id,
+    binding_to_id,
+)
+from openpiano.core.keybind_remap import migrate_legacy_keybinds
 from openpiano.core.normalize import clamp_float, clamp_int
 from openpiano.core.audio_levels import normalize_volume
+from openpiano.core.sound_presets import (
+    SoundPreset,
+    default_sound_presets,
+    normalize_sound_presets,
+    sound_presets_payload,
+)
 from openpiano.core.split import SplitZone, default_split_zones, normalize_split_zones, split_zones_payload
 
 SETTINGS_FILE_NAME = "OpenPiano_config.json"
 ThemeMode = Literal["dark", "light"]
 AnimationSpeed = Literal["instant", "fast", "normal", "slow", "very_slow"]
-KeyboardInputMode = Literal["layout", "qwerty"]
 
 
 class SettingsSaveError(RuntimeError):
@@ -72,12 +85,11 @@ class AppSettings:
     black_key_pressed_color: str = ""
     window_x: int | None = None
     window_y: int | None = None
-    keyboard_input_mode: KeyboardInputMode = "layout"
-    keyboard_layout_choice_seen: bool = False
-    custom_keybinds: dict[str, str] = field(default_factory=dict)
+    custom_keybinds: dict[str, str | None] = field(default_factory=dict)
     split_zones: tuple[SplitZone, ...] = field(default_factory=default_split_zones)
     plugin_folders: tuple[str, ...] = ()
     split_open: bool = False
+    sound_presets: tuple[SoundPreset, ...] = field(default_factory=default_sound_presets)
 
 
 def _appdata_settings_dir() -> Path | None:
@@ -177,12 +189,6 @@ def _clamp_animation_speed(value: Any) -> AnimationSpeed:
     return "instant"
 
 
-def _clamp_keyboard_input_mode(value: Any) -> KeyboardInputMode:
-    if isinstance(value, str) and value in {"layout", "qwerty"}:
-        return value
-    return "layout"
-
-
 def _clamp_midi_device_name(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -213,12 +219,12 @@ def _clamp_optional_window_position(value: Any) -> int | None:
     return max(-100000, min(100000, parsed))
 
 
-def _clamp_custom_keybinds(value: Any) -> dict[str, str]:
+def _clamp_custom_keybinds(value: Any) -> dict[str, str | None]:
     if not isinstance(value, dict):
         return {}
-    parsed: dict[str, str] = {}
+    parsed: dict[str, str | None] = {}
     for note_raw, binding_raw in value.items():
-        if not isinstance(binding_raw, str):
+        if binding_raw is not None and not isinstance(binding_raw, str):
             continue
         try:
             note = int(str(note_raw).strip())
@@ -226,10 +232,11 @@ def _clamp_custom_keybinds(value: Any) -> dict[str, str]:
             continue
         if note < MIDI_START_88 or note > MIDI_END_88:
             continue
-        normalized = binding_from_id(binding_raw)
-        if normalized is None:
+        if binding_raw is None:
+            parsed[str(note)] = None
             continue
-        parsed[str(note)] = binding_to_id(normalized)
+        normalized = binding_from_id(binding_raw)
+        parsed[str(note)] = binding_to_id(normalized) if normalized is not None else binding_raw
     return parsed
 
 
@@ -242,6 +249,56 @@ def _clamp_plugin_folders(value: Any) -> tuple[str, ...]:
         if text and text not in folders:
             folders.append(text)
     return tuple(folders[:32])
+
+
+def _load_custom_keybinds(payload: dict[str, Any]) -> dict[str, str | None]:
+    bindings = _clamp_custom_keybinds(payload.get("custom_keybinds"))
+    if payload.get("keybind_schema_version") == KEYBIND_SCHEMA_VERSION:
+        return bindings
+    valid = {}
+    for note, value in bindings.items():
+        parsed = binding_from_id(value) if value is not None else None
+        if value is None or parsed is not None:
+            valid[int(note)] = parsed
+    migrated = migrate_legacy_keybinds(valid, str(payload.get("keyboard_input_mode", "layout")))
+    for note, binding in migrated.items():
+        bindings[str(note)] = binding_to_id(binding) if binding is not None else None
+    return bindings
+
+
+def _preserve_legacy_keybind_settings(file_path: Path) -> None:
+    try:
+        original = file_path.read_bytes()
+    except FileNotFoundError:
+        return
+    try:
+        payload = json.loads(original.decode("utf-8-sig"))
+    except (ValueError, UnicodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    try:
+        version = int(payload.get("keybind_schema_version", 0))
+    except (TypeError, ValueError, OverflowError):
+        version = 0
+    if version >= KEYBIND_SCHEMA_VERSION:
+        return
+    backup = file_path.with_name(f"{file_path.name}.keybinds-v1.bak")
+    try:
+        handle = backup.open("xb")
+    except FileExistsError:
+        return
+    try:
+        with handle:
+            handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def load_settings(path: Path | None = None) -> AppSettings:
@@ -287,12 +344,11 @@ def load_settings(path: Path | None = None) -> AppSettings:
     black_key_pressed_color = _clamp_color(payload.get("black_key_pressed_color"))
     window_x = _clamp_optional_window_position(payload.get("window_x"))
     window_y = _clamp_optional_window_position(payload.get("window_y"))
-    keyboard_input_mode = _clamp_keyboard_input_mode(payload.get("keyboard_input_mode"))
-    keyboard_layout_choice_seen = _clamp_bool(payload.get("keyboard_layout_choice_seen"), False)
-    custom_keybinds = _clamp_custom_keybinds(payload.get("custom_keybinds"))
+    custom_keybinds = _load_custom_keybinds(payload)
     split_zones = normalize_split_zones(payload.get("split_zones"))
     plugin_folders = _clamp_plugin_folders(payload.get("plugin_folders"))
     split_open = _clamp_bool(payload.get("split_open"), False)
+    sound_presets = normalize_sound_presets(payload.get("sound_presets"))
     return AppSettings(
         mode=mode,
         instrument_id=instrument_id,
@@ -320,12 +376,11 @@ def load_settings(path: Path | None = None) -> AppSettings:
         black_key_pressed_color=black_key_pressed_color,
         window_x=window_x,
         window_y=window_y,
-        keyboard_input_mode=keyboard_input_mode,
-        keyboard_layout_choice_seen=keyboard_layout_choice_seen,
         custom_keybinds=custom_keybinds,
         split_zones=split_zones,
         plugin_folders=plugin_folders,
         split_open=split_open,
+        sound_presets=sound_presets,
     )
 
 
@@ -362,12 +417,12 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
         "black_key_pressed_color": _clamp_color(settings.black_key_pressed_color),
         "window_x": _clamp_optional_window_position(settings.window_x),
         "window_y": _clamp_optional_window_position(settings.window_y),
-        "keyboard_input_mode": _clamp_keyboard_input_mode(settings.keyboard_input_mode),
-        "keyboard_layout_choice_seen": _clamp_bool(settings.keyboard_layout_choice_seen, False),
+        "keybind_schema_version": KEYBIND_SCHEMA_VERSION,
         "custom_keybinds": _clamp_custom_keybinds(settings.custom_keybinds),
         "split_zones": split_zones_payload(settings.split_zones),
         "plugin_folders": list(_clamp_plugin_folders(settings.plugin_folders)),
         "split_open": _clamp_bool(settings.split_open, False),
+        "sound_presets": sound_presets_payload(settings.sound_presets),
     }
     raw = json.dumps(payload, indent=2)
 
@@ -375,6 +430,7 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
     temp_path: Path | None = None
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        _preserve_legacy_keybind_settings(file_path)
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",

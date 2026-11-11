@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable
 from .update_dialog import get_update_dialog, ask_update_install_preference, ask_update_handoff
 from shiboken6 import isValid
 
-from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -50,7 +50,6 @@ from openpiano.core.config import (
     UI_SCALE_STEP,
     normalize_piano_style,
 )
-from openpiano.core.keymap import current_layout_demo_rows, qwerty_demo_rows
 from openpiano.core.audio_levels import normalize_volume
 from openpiano.core.object_tree import is_descendant_of
 from openpiano.core.plugin_registry import is_plugin_instrument_id
@@ -76,12 +75,15 @@ from openpiano.ui.panel_sections import (
 )
 from openpiano.ui.piano_widget import PianoWidget
 from openpiano.ui.plugin_folders_dialog import PluginDetailsDialog, PluginFoldersDialog
+from openpiano.ui.sound_presets_dialog import SoundPresetRow, SoundPresetsDialog
 from openpiano.ui.split_panel import (
-    ElidedLabel,
+    KEY_SCAN_TEXT,
+    KEY_SCAN_TOOLTIP,
     PluginCardControls,
     configure_split_grid,
     create_split_card,
     other_zone_ranges,
+    show_key_scan_state,
 )
 from openpiano.ui.spotlight_overlay import SpotlightOverlay
 from openpiano.ui.stats_bar import StatsBar
@@ -114,8 +116,8 @@ PIANO_STYLE_LABELS = {
 FOOTER_ICON_SIZE = 18
 # Height of the Keyboard Split drawer before its contents have been measured.
 SPLIT_PANEL_HEIGHT_GUESS = 170
-PLUGIN_SOUND_HINT = "Choose the sound in the plug-in's own window."
-PLUGIN_SOUND_TOOLTIP = ("Bank and Preset pick a sound inside a SoundFont. A plug-in has no such lists: "
+PLUGIN_SOUND_TOOLTIP = ("Open the plug-in's own window to choose and adjust its sound.\n"
+                        "Bank and Preset pick a sound inside a SoundFont. A plug-in has no such lists:\n"
                         "its sounds are chosen in its own window.")
 
 
@@ -135,7 +137,7 @@ class MainWindow(QMainWindow):
     showKeyLabelsChanged = Signal(bool)
     showNoteLabelsChanged = Signal(bool)
     changeKeybindsRequested = Signal()
-    changeKeyboardLayoutRequested = Signal()
+    resetKeybindsRequested = Signal()
     doneKeybindsRequested = Signal()
     discardKeybindsRequested = Signal()
     keybindEditActionBlocked = Signal()
@@ -171,6 +173,8 @@ class MainWindow(QMainWindow):
     pluginRescanRequested = Signal()
     pluginFoldersRequested = Signal()
     pluginEditorRequested = Signal(int)
+    pluginKeyScanRequested = Signal()
+    soundPresetAction = Signal(str, int, str)
 
     def __init__(self, theme: ThemePalette, icon_path: Path | None = None) -> None:
         super().__init__()
@@ -187,6 +191,11 @@ class MainWindow(QMainWindow):
         self._settings_visible = False
         self._controls_visible = False
         self._split_visible = False
+        self._sound_presets_dialog: SoundPresetsDialog | None = None
+        self._sound_preset_rows: tuple[SoundPresetRow, ...] = ()
+        self._sound_preset_learning: int | None = None
+        self._sound_preset_learning_pc = False
+        self._sound_preset_notice = ""
         self._plugin_sound_mode = False
         self._plugin_editor_available = False
         self._audio_loading = False
@@ -448,9 +457,12 @@ class MainWindow(QMainWindow):
         self.change_keybinds_button = QPushButton("Change Keybinds", self.keybind_row_widget)
         self.change_keybinds_button.setObjectName("actionButton")
         self.change_keybinds_button.clicked.connect(self.changeKeybindsRequested.emit)
-        self.change_layout_button = QPushButton("Change Layout", self.keybind_row_widget)
-        self.change_layout_button.setObjectName("actionButton")
-        self.change_layout_button.clicked.connect(self.changeKeyboardLayoutRequested.emit)
+        self.reset_keybinds_button = QPushButton("Reset Keybinds", self.keybind_row_widget)
+        self.reset_keybinds_button.setObjectName("actionButton")
+        self.reset_keybinds_button.setToolTip(
+            "Restore all 61- and 88-key bindings to their defaults. Choose Save to apply or Discard to cancel."
+        )
+        self.reset_keybinds_button.clicked.connect(self.resetKeybindsRequested.emit)
         self.save_keybinds_button = QPushButton("Save", self.keybind_row_widget)
         self.save_keybinds_button.setObjectName("actionButton")
         self.save_keybinds_button.clicked.connect(self.doneKeybindsRequested.emit)
@@ -461,16 +473,16 @@ class MainWindow(QMainWindow):
         self.discard_keybinds_button.setVisible(False)
         keybind_row.addWidget(keybind_label)
         keybind_row.addWidget(self.change_keybinds_button)
-        keybind_row.addWidget(self.change_layout_button)
         keybind_row.addWidget(self.save_keybinds_button)
         keybind_row.addWidget(self.discard_keybinds_button)
+        keybind_row.addWidget(self.reset_keybinds_button)
         keybind_row.addStretch(1)
         keyboard_layout.addWidget(self.keybind_row_widget)
 
         keybind_hint_row = QHBoxLayout()
         self._configure_settings_row(keybind_hint_row)
         keybind_hint_row.setContentsMargins(6, self._sp(0), 6, self._sp(3))
-        self.keybind_hint_label = QLabel("Customize keyboard and mouse triggers for piano keys.", self.keyboard_card)
+        self.keybind_hint_label = QLabel("Customize keyboard and mouse bindings. Key labels follow your Windows keyboard layout.", self.keyboard_card)
         self.keybind_hint_label.setObjectName("settingHint")
         self.keybind_hint_label.setWordWrap(True)
         self.keybind_hint_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -484,6 +496,7 @@ class MainWindow(QMainWindow):
         self.plugin_controls.foldersRequested.connect(self.pluginFoldersRequested.emit)
         self.plugin_controls.editorRequested.connect(lambda: self.pluginEditorRequested.emit(-1))
         self.plugin_controls.detailsRequested.connect(self.show_plugin_details)
+        self.plugin_controls.keyScanRequested.connect(self.pluginKeyScanRequested.emit)
 
         self.interface_card, interface_layout = self._create_section_card("Interface", self.settings_body)
         layout.addWidget(self.interface_card)
@@ -727,14 +740,17 @@ class MainWindow(QMainWindow):
         plugin_sound_layout.setSpacing(self._sp(8))
         self.plugin_window_button = QPushButton("Open Plug-in Window", self.plugin_sound_row)
         self.plugin_window_button.setObjectName("actionButton")
-        self.plugin_window_button.setToolTip("Open the plug-in's own window to choose and adjust its sound.")
+        self.plugin_window_button.setToolTip(PLUGIN_SOUND_TOOLTIP)
         self.plugin_window_button.setEnabled(False)
         self.plugin_window_button.clicked.connect(lambda: self.pluginEditorRequested.emit(-1))
-        self.plugin_sound_hint = ElidedLabel(self.plugin_sound_row)
-        self.plugin_sound_hint.setObjectName("settingHint")
-        self.plugin_sound_hint.set_full_text(PLUGIN_SOUND_HINT, PLUGIN_SOUND_TOOLTIP)
+        self.plugin_keys_button = QPushButton(KEY_SCAN_TEXT, self.plugin_sound_row)
+        self.plugin_keys_button.setObjectName("actionButton")
+        self.plugin_keys_button.setToolTip(KEY_SCAN_TOOLTIP)
+        self.plugin_keys_button.setEnabled(False)
+        self.plugin_keys_button.clicked.connect(self.pluginKeyScanRequested.emit)
         plugin_sound_layout.addWidget(self.plugin_window_button)
-        plugin_sound_layout.addWidget(self.plugin_sound_hint, 1)
+        plugin_sound_layout.addWidget(self.plugin_keys_button)
+        plugin_sound_layout.addStretch(1)
         self.plugin_sound_row.hide()
 
         midi_label = QLabel("MIDI In", self.controls_card)
@@ -933,6 +949,7 @@ class MainWindow(QMainWindow):
                                + self.bank_combo.minimumWidth())
         width = max(all_notes_width, self.plugin_window_button.sizeHint().width())
         self.plugin_window_button.setFixedSize(width, self.instrument_combo.sizeHint().height())
+        self.plugin_keys_button.setFixedHeight(self.instrument_combo.sizeHint().height())
         if self._plugin_sound_mode:
             self.all_notes_off_button.setMinimumWidth(width)
             self.all_notes_off_button.setMaximumWidth(width)
@@ -1055,6 +1072,10 @@ class MainWindow(QMainWindow):
         self.split_toggle_button.setChecked(self._split_visible)
         self.split_toggle_button.clicked.connect(self._on_split_toggle_clicked)
 
+        self.presets_button = FooterButton("", self.footer_bar)
+        self.presets_button.setObjectName("footerIcon")
+        self.presets_button.clicked.connect(self.show_sound_presets)
+
         self.tutorial_button = FooterButton("Tutorial", self.footer_bar)
         self.tutorial_button.setObjectName("footerLink")
         self.tutorial_button.clicked.connect(self.tutorialRequested.emit)
@@ -1071,6 +1092,7 @@ class MainWindow(QMainWindow):
             self.stats_toggle_button,
             self.controls_toggle_button,
             self.split_toggle_button,
+            self.presets_button,
             self.tutorial_button,
             self.website_button,
             self.donate_button,
@@ -1084,6 +1106,8 @@ class MainWindow(QMainWindow):
             (self.settings_toggle_button, "Settings", "Show or hide settings"),
             (self.controls_toggle_button, "Controls", "Show controls"),
             (self.split_toggle_button, "Keyboard split", "Show keyboard split"),
+            (self.presets_button, "Sound presets",
+             "Sound presets: store sounds and recall them with keys of the MIDI keyboard"),
             (self.stats_toggle_button, "Stats", "Hide stats"),
             (self.website_button, "Official website", "Open the OpenPiano website in your browser"),
             (self.tutorial_button, "Tutorial", "Start the guided tutorial"),
@@ -1092,8 +1116,8 @@ class MainWindow(QMainWindow):
             describe_footer_button(button, name, description)
         footer_buttons = (
             self.theme_toggle_button, self.pin_toggle_button, self.settings_toggle_button,
-            self.controls_toggle_button, self.split_toggle_button, self.stats_toggle_button,
-            self.website_button, self.tutorial_button, self.donate_button,
+            self.controls_toggle_button, self.split_toggle_button, self.presets_button,
+            self.stats_toggle_button, self.website_button, self.tutorial_button, self.donate_button,
         )
         for previous, following in zip(footer_buttons, footer_buttons[1:]):
             QWidget.setTabOrder(previous, following)
@@ -1103,6 +1127,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.settings_toggle_button, 0, Qt.AlignLeft)
         row.addWidget(self.controls_toggle_button, 0, Qt.AlignLeft)
         row.addWidget(self.split_toggle_button, 0, Qt.AlignLeft)
+        row.addWidget(self.presets_button, 0, Qt.AlignLeft)
         row.addWidget(self.stats_toggle_button, 0, Qt.AlignLeft)
         row.addStretch(1)
         row.addWidget(self.website_button, 0, Qt.AlignRight)
@@ -1123,6 +1148,7 @@ class MainWindow(QMainWindow):
             (self.settings_toggle_button, "settings"),
             (self.controls_toggle_button, "controls"),
             (self.split_toggle_button, "split"),
+            (self.presets_button, "presets"),
             (self.stats_toggle_button, "stats"),
             (self.website_button, "website"),
         ):
@@ -2488,234 +2514,6 @@ class MainWindow(QMainWindow):
         if dialog is not None:
             dialog.hide()
 
-    def _build_layout_demo_widget(self, rows: tuple[tuple[str, ...], ...], parent: QWidget) -> QWidget:
-        container = QWidget(parent)
-        container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(0, 0, 0, 0)
-        container_layout.setSpacing(self._sp(4))
-        row_offsets = (self._sp(0), self._sp(10), self._sp(18), self._sp(26))
-        for index, row in enumerate(rows):
-            row_widget = QWidget(container)
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(self._sp(5))
-            row_layout.addSpacing(row_offsets[index] if index < len(row_offsets) else self._sp(26))
-            for token in row:
-                text = str(token or "?")
-                keycap = QLabel(text, row_widget)
-                keycap.setObjectName("layoutKeyCap")
-                keycap.setAlignment(Qt.AlignCenter)
-                width_units = max(1, min(3, len(text)))
-                keycap.setFixedSize(self._sp(22 + (width_units * 8)), self._sp(24))
-                row_layout.addWidget(keycap)
-            row_layout.addStretch(1)
-            container_layout.addWidget(row_widget)
-        container_layout.addStretch(1)
-        return container
-
-    def ask_keyboard_input_mode_choice(self) -> str | None:
-        root = self.centralWidget()
-        if root is None:
-            return None
-
-        qwerty_rows = qwerty_demo_rows()
-        layout_rows = current_layout_demo_rows()
-        choice: dict[str, str | None] = {"mode": None}
-
-        def _rgba_css(color: QColor) -> str:
-            return f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha()})"
-
-        if self._theme_mode == "light":
-            overlay_color = QColor(15, 20, 28, 140)
-            demo_card_color = QColor(self.theme.panel_bg)
-            demo_card_color.setAlpha(244)
-            side_card_color = QColor(self.theme.panel_bg).darker(103)
-            side_card_color.setAlpha(236)
-            keycap_color = QColor(self.theme.panel_bg).darker(110)
-            keycap_color.setAlpha(246)
-        else:
-            overlay_color = QColor(0, 0, 0, 212)
-            demo_card_color = QColor(self.theme.panel_bg)
-            demo_card_color.setAlpha(222)
-            side_card_color = QColor(self.theme.panel_bg).lighter(112)
-            side_card_color.setAlpha(214)
-            keycap_color = QColor(self.theme.panel_bg).lighter(135)
-            keycap_color.setAlpha(224)
-
-        overlay = QFrame(root)
-        overlay.setObjectName("keyboardLayoutChoiceOverlay")
-        overlay.setGeometry(root.rect())
-        overlay.setStyleSheet(
-            f"""
-            QFrame#keyboardLayoutChoiceOverlay {{
-                background: {_rgba_css(overlay_color)};
-            }}
-            QFrame#layoutDemoCard {{
-                background: {_rgba_css(demo_card_color)};
-                border: 2px solid {self.theme.border};
-                border-radius: {self._sp(12)}px;
-            }}
-            QFrame#layoutSideCard {{
-                background: {_rgba_css(side_card_color)};
-                border: 1px solid {self.theme.border};
-                border-radius: {self._sp(10)}px;
-            }}
-            QLabel#layoutOverlayTitle {{
-                color: {self.theme.text_primary};
-                font: 900 {self._sp(12)}pt "Segoe UI";
-            }}
-            QLabel#layoutOverlaySub {{
-                color: {self.theme.text_secondary};
-                font: 600 {self._sp(9)}pt "Segoe UI";
-            }}
-            QLabel#layoutSideTitle {{
-                color: {self.theme.text_primary};
-                font: 700 {self._sp(10)}pt "Segoe UI";
-            }}
-            QLabel#layoutSideSub {{
-                color: {self.theme.text_secondary};
-                font: 600 {self._sp(8)}pt "Segoe UI";
-            }}
-            QFrame#layoutVSplit {{
-                background: {self.theme.border};
-                min-width: 1px;
-                max-width: 1px;
-            }}
-            QLabel#layoutKeyCap {{
-                color: {self.theme.text_primary};
-                background: {_rgba_css(keycap_color)};
-                border: 1px solid {self.theme.border};
-                border-bottom: 2px solid {self.theme.accent_hover};
-                border-radius: {self._sp(6)}px;
-                font: 700 {self._sp(8)}pt "Consolas";
-                padding: 0px {self._sp(4)}px;
-            }}
-            QPushButton#layoutChoiceButton {{
-                background: {self.theme.panel_bg};
-                color: {self.theme.text_primary};
-                border: 1px solid {self.theme.border};
-                border-radius: {self._sp(7)}px;
-                padding: {self._sp(6)}px {self._sp(10)}px;
-                font: 700 {self._sp(9)}pt "Segoe UI";
-            }}
-            QPushButton#layoutChoiceButton:hover {{
-                background: {self.theme.accent};
-                border-color: {self.theme.accent_hover};
-            }}
-            """
-        )
-
-        piano_top_left = self.piano_widget.mapTo(root, QPoint(0, 0))
-        piano_rect = QRect(piano_top_left, self.piano_widget.size()).adjusted(6, 6, -6, -6)
-        if not piano_rect.isValid():
-            piano_rect = QRect(
-                self._sp(12),
-                self._sp(90),
-                max(self._sp(420), overlay.width() - self._sp(24)),
-                self._sp(220),
-            )
-        demo_top = max(self._sp(50), piano_rect.top() - self._sp(8))
-        demo_bottom = min(overlay.height() - self._sp(22), piano_rect.bottom() + self._sp(152))
-        min_demo_height = self._sp(312)
-        if demo_bottom - demo_top < min_demo_height:
-            demo_bottom = min(overlay.height() - self._sp(12), demo_top + min_demo_height)
-        demo_rect = QRect(piano_rect.left(), demo_top, piano_rect.width(), max(self._sp(240), demo_bottom - demo_top))
-
-        title = QLabel("Choose Keyboard Mapping", overlay)
-        title.setObjectName("layoutOverlayTitle")
-        title.adjustSize()
-        title_x = max(0, (overlay.width() - title.width()) // 2)
-        title_y = max(self._sp(10), demo_rect.top() - self._sp(42))
-        title.move(title_x, title_y)
-
-        demo = QFrame(overlay)
-        demo.setObjectName("layoutDemoCard")
-        demo.setGeometry(demo_rect)
-        demo_outer = QVBoxLayout(demo)
-        demo_outer.setContentsMargins(self._sp(14), self._sp(10), self._sp(14), self._sp(10))
-        demo_outer.setSpacing(self._sp(10))
-
-        split_layout = QHBoxLayout()
-        split_layout.setContentsMargins(0, 0, 0, 0)
-        split_layout.setSpacing(self._sp(12))
-
-        left = QFrame(demo)
-        left.setObjectName("layoutSideCard")
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(self._sp(10), self._sp(8), self._sp(10), self._sp(8))
-        left_layout.setSpacing(self._sp(7))
-        left_title = QLabel("QWERTY Layout", left)
-        left_title.setObjectName("layoutSideTitle")
-        left_sub = QLabel("Uses standard QWERTY layout", left)
-        left_sub.setObjectName("layoutSideSub")
-        left_preview = self._build_layout_demo_widget(qwerty_rows, left)
-        left_choose = QPushButton("Use QWERTY Layout", left)
-        left_choose.setObjectName("layoutChoiceButton")
-        left_choose.clicked.connect(lambda _checked=False: _set_choice("qwerty"))
-        left_layout.addWidget(left_title)
-        left_layout.addWidget(left_sub)
-        left_layout.addWidget(left_preview, 1)
-        left_layout.addWidget(left_choose, 0, Qt.AlignLeft)
-
-        v_split = QFrame(demo)
-        v_split.setObjectName("layoutVSplit")
-
-        right = QFrame(demo)
-        right.setObjectName("layoutSideCard")
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(self._sp(10), self._sp(8), self._sp(10), self._sp(8))
-        right_layout.setSpacing(self._sp(7))
-        right_title = QLabel("Current Keyboard Layout", right)
-        right_title.setObjectName("layoutSideTitle")
-        right_sub = QLabel("Uses letters from your keyboard language", right)
-        right_sub.setObjectName("layoutSideSub")
-        right_preview = self._build_layout_demo_widget(layout_rows, right)
-        right_choose = QPushButton("Use Current Layout", right)
-        right_choose.setObjectName("layoutChoiceButton")
-        right_choose.clicked.connect(lambda _checked=False: _set_choice("layout"))
-        right_layout.addWidget(right_title)
-        right_layout.addWidget(right_sub)
-        right_layout.addWidget(right_preview, 1)
-        right_layout.addWidget(right_choose, 0, Qt.AlignLeft)
-
-        split_layout.addWidget(left, 1)
-        split_layout.addWidget(v_split)
-        split_layout.addWidget(right, 1)
-        demo_outer.addLayout(split_layout, 1)
-
-        cancel_row = QHBoxLayout()
-        cancel_row.setContentsMargins(0, 0, 0, 0)
-        cancel_row.setSpacing(self._sp(8))
-        cancel_row.addStretch(1)
-        cancel_button = QPushButton("Decide Later (Use Current Layout)", demo)
-        cancel_button.setObjectName("layoutChoiceButton")
-        cancel_row.addWidget(cancel_button)
-        cancel_row.addStretch(1)
-        demo_outer.addLayout(cancel_row)
-
-        loop = QEventLoop(self)
-
-        def _finish() -> None:
-            if loop.isRunning():
-                loop.quit()
-
-        def _set_choice(mode: str) -> None:
-            choice["mode"] = mode
-            _finish()
-
-        cancel_button.clicked.connect(lambda _checked=False: _finish())
-        overlay.destroyed.connect(_finish)
-
-        apply_dialog_button_cursors_util(overlay)
-        overlay.show()
-        overlay.raise_()
-        overlay.setFocus(Qt.ActiveWindowFocusReason)
-        loop.exec()
-        overlay.deleteLater()
-        self._restore_cursor_state_after_modal()
-        selected = choice["mode"]
-        return str(selected) if selected is not None else None
-
     def _apply_windows_title_bar_theme(self, target: QWidget | None = None) -> None:
         if sys.platform != "win32":
             return
@@ -2771,6 +2569,10 @@ class MainWindow(QMainWindow):
         self.stats_bar.set_theme(theme)
         self.piano_widget.set_theme(theme)
         self._apply_style()
+        dialog = self._sound_presets_dialog
+        if dialog is not None and isValid(dialog):
+            dialog.apply_theme(theme)
+            self._apply_windows_title_bar_theme(dialog)
 
     def set_mode(self, mode: PianoMode) -> None:
         target = self.mode_88_btn if mode == "88" else self.mode_61_btn
@@ -2885,6 +2687,11 @@ class MainWindow(QMainWindow):
         self.plugin_controls.set_editor_available(available)
         self.plugin_window_button.setEnabled(self._plugin_editor_available and not self._audio_loading)
 
+    def set_plugin_key_scan_state(self, available: bool, scanning: bool) -> None:
+        """The Find Silent Keys buttons: offered while a plug-in is in use, busy during a scan."""
+        self.plugin_controls.set_key_scan_state(available, scanning)
+        show_key_scan_state(self.plugin_keys_button, available, scanning)
+
     def show_plugin_details(self) -> None:
         dialog = PluginDetailsDialog(self, self.theme, self.plugin_controls.report_text())
         with self._transient_dialog(dialog):
@@ -2894,6 +2701,41 @@ class MainWindow(QMainWindow):
             apply_dialog_button_cursors_util(dialog)
             self._apply_windows_title_bar_theme(dialog)
             dialog.exec()
+
+    def show_sound_presets(self) -> None:
+        """Open the sound presets window, or bring it to the front. It is not modal: sounds are
+        chosen in the main window while it stays open."""
+        dialog = self._sound_presets_dialog
+        if dialog is None or not isValid(dialog):
+            dialog = SoundPresetsDialog(self, self.theme)
+            dialog.action.connect(self.soundPresetAction.emit)
+            window_icon = self.windowIcon()
+            if not window_icon.isNull():
+                dialog.setWindowIcon(window_icon)
+            self._sound_presets_dialog = dialog
+        dialog.set_presets(self._sound_preset_rows, self._sound_preset_learning,
+                           self._sound_preset_learning_pc, self._sound_preset_notice)
+        self._apply_windows_title_bar_theme(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def set_sound_presets(self, rows: list[SoundPresetRow], learning_index: int | None = None,
+                          learning_pc: bool = False, notice: str = "") -> None:
+        self._sound_preset_rows = tuple(rows)
+        self._sound_preset_learning = learning_index
+        self._sound_preset_learning_pc = bool(learning_pc)
+        self._sound_preset_notice = str(notice or "")
+        dialog = self._sound_presets_dialog
+        if dialog is not None and isValid(dialog):
+            dialog.set_presets(self._sound_preset_rows, learning_index, learning_pc, notice)
+
+    def sound_presets_window_active(self) -> bool:
+        """Whether the Sound Presets window is the one in front, with no name being typed."""
+        dialog = self._sound_presets_dialog
+        if dialog is None or not isValid(dialog) or QApplication.activeWindow() is not dialog:
+            return False
+        return not isinstance(QApplication.focusWidget(), QLineEdit)
 
     def ask_plugin_folders(self, default_folders: list[str], folders: list[str]) -> list[str] | None:
         dialog = PluginFoldersDialog(self, self.theme, default_folders, folders)
@@ -3055,7 +2897,6 @@ class MainWindow(QMainWindow):
     def set_keybind_edit_mode(self, active: bool, status_text: str = "") -> None:
         self._keybind_edit_active = bool(active)
         self.change_keybinds_button.setVisible(not self._keybind_edit_active)
-        self.change_layout_button.setVisible(not self._keybind_edit_active)
         self.save_keybinds_button.setVisible(self._keybind_edit_active)
         self.save_keybinds_button.setEnabled(self._keybind_edit_active)
         self.discard_keybinds_button.setVisible(self._keybind_edit_active)
@@ -3063,7 +2904,7 @@ class MainWindow(QMainWindow):
         if self._keybind_edit_active:
             self.keybind_hint_label.setText(
                 status_text
-                or "Select a key on the piano, then press a keyboard combo or mouse combo. Press Save or Discard when finished. Ctrl+Z undoes the last change."
+                or "Select a piano key, then press a keyboard or mouse combination to assign it. Delete clears its binding. Ctrl+Z undoes the last change. Choose Save or Discard when finished."
             )
             self._sync_keybind_overlay()
             self._keybind_overlay.show()
@@ -3071,7 +2912,7 @@ class MainWindow(QMainWindow):
         else:
             self.keybind_hint_label.setText(
                 status_text
-                or "Customize keyboard and mouse triggers for piano keys."
+                or "Customize keyboard and mouse bindings. Key labels follow your Windows keyboard layout."
             )
             self._keybind_overlay.hide()
 
@@ -3278,6 +3119,7 @@ class MainWindow(QMainWindow):
             return
         self.settings_scroll.ensureWidgetVisible(target, 0, self._sp(18))
         self._sync_tutorial_overlay()
+        self._sync_keybind_overlay()
 
     def ensure_controls_target_visible(self, target: QWidget) -> None:
         if not is_descendant_of(target, self.controls_scroll):

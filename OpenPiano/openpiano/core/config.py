@@ -4,15 +4,25 @@ from __future__ import annotations
 from typing import Literal, cast
 
 from openpiano.core.normalize import clamp_float, quantize_step
+from openpiano.update_product import DOWNLOAD_PAGE_URL, RELEASES_REPOSITORY
 
 APP_NAME = "OpenPiano"
-APP_VERSION = "2.0.1"
-INNO_SETUP_APP_ID = "OpenPianoJustagwas"
+# The first three numbers are the release of the original OpenPiano this build is based on,
+# the fourth is the revision of this fork. A release tagged with a higher number on
+# RELEASES_REPOSITORY is offered as an update, so raise this before building a release.
+APP_VERSION = "2.0.2.1"
+# Not the original's installer id, so that an installation of the original is never taken
+# for one of this fork.
+INNO_SETUP_APP_ID = "OpenPianoThecatt6"
 OFFICIAL_WEBSITE_URL = "https://www.justagwas.com/projects/openpiano"
 DONATE_PAGE_URL = "https://www.justagwas.com/donate"
 
-UPDATE_CHECK_MANIFEST_URL = "https://www.justagwas.com/projects/openpiano/latest.json"
-UPDATE_CHECK_SETUP_URL = "https://downloads.justagwas.com/openpiano/OpenPianoSetup.exe"
+# Updates come from this fork's GitHub releases, never from the original's site: the original
+# installer would replace this build with one that has no keyboard split or plug-ins.
+UPDATE_CHECK_MANIFEST_URL = f"https://api.github.com/repos/{RELEASES_REPOSITORY}/releases/latest"
+UPDATE_PAGE_URL = DOWNLOAD_PAGE_URL
+# The fork publishes no installer, so there is nothing to install in place.
+UPDATE_CHECK_SETUP_URL = ""
 
 DEFAULT_THEME_MODE: Literal["dark", "light"] = "dark"
 PianoStyle = Literal["premium", "classic", "effects"]

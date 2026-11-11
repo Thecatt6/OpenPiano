@@ -160,6 +160,10 @@ def build(*, one_file: bool, console: bool, soundfont_folders: list[Path]) -> in
     else:
         print("No SoundFont was packed in. The program will only have the SoundFonts found in\n"
               "%LOCALAPPDATA%\\OpenPiano\\soundfonts on the computer where it runs.")
+    from openpiano.core.config import APP_VERSION
+    from openpiano.update_product import RELEASES_REPOSITORY
+    print(f"\nThis is version {APP_VERSION}. Copies with a lower version offer it as an update once it is\n"
+          f"published as a release tagged v{APP_VERSION} on github.com/{RELEASES_REPOSITORY}.")
     return 0
 
 

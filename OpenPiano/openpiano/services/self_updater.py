@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from ..update_handoff import arm_update
 
+from ..update_cleanup import PreparationLease, discard_staging, maintain_updates
+
 import hashlib
 import json
 import os
@@ -15,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
 from typing import Callable
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -25,20 +28,15 @@ try:
 except Exception:
     winreg = None
 
-_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# Three numbers, or four: this fork adds its own revision to the original's version (2.0.2.1).
+_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MANIFEST_ALLOWED_HOSTS = {
-    "justagwas.com",
-    "www.justagwas.com",
+    "api.github.com",
 }
 _UPDATE_ALLOWED_HOSTS = {
     "github.com",
     "www.github.com",
-    "sourceforge.net",
-    "www.sourceforge.net",
-    "justagwas.com",
-    "www.justagwas.com",
-    "downloads.justagwas.com",
     "objects.githubusercontent.com",
     "github-releases.githubusercontent.com",
 }
@@ -57,11 +55,11 @@ def normalize_version(version_text: str) -> str:
     return text
 
 
-def parse_semver(value: str) -> tuple[int, int, int] | None:
+def parse_semver(value: str) -> tuple[int, int, int, int] | None:
     match = _SEMVER_RE.search(str(value or ""))
     if not match:
         return None
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4) or 0)
 
 
 def is_newer_version(latest_version: str, current_version: str) -> bool:
@@ -117,7 +115,8 @@ def _normalize_semver(value: str) -> str:
     parsed = parse_semver(normalize_version(value))
     if parsed is None:
         raise RuntimeError("did not contain a valid semantic version")
-    return f"{parsed[0]}.{parsed[1]}.{parsed[2]}"
+    text = f"{parsed[0]}.{parsed[1]}.{parsed[2]}"
+    return f"{text}.{parsed[3]}" if parsed[3] else text
 
 
 def _normalize_channel(value: object, *, default: str = "stable") -> str:
@@ -145,6 +144,39 @@ class UpdateManifest:
     notes: list[str] = field(default_factory=list)
     channel: str = "stable"
     minimum_supported_version: str = "1.0.0"
+
+
+def _release_notes(body: object) -> list[str]:
+    """The first lines of a release description, as plain text for the update dialog."""
+    lines = [line.strip() for line in str(body or "").splitlines()]
+    listed = [line[2:] for line in lines if line.startswith(("- ", "* "))]
+    chosen = listed or [line for line in lines if line and not line.startswith(("#", "<", "---", "```", "|"))]
+    notes: list[str] = []
+    for line in chosen:
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)
+        text = re.sub(r"[*`]+", "", text).strip()
+        if text:
+            notes.append(text[:200])
+        if len(notes) == 8:
+            break
+    return notes
+
+
+def manifest_from_github_release(data: dict, *, fallback_url: str) -> UpdateManifest:
+    """Reads GitHub's answer for the latest release of a repository.
+
+    The version is the release tag. No installer is taken from the release, so the update is
+    always offered as a page to open and never installed in place.
+    """
+    tag = data.get("tag_name")
+    if not isinstance(tag, str) or parse_semver(normalize_version(tag)) is None:
+        raise RuntimeError(f"The newest release is tagged {tag!r}, which is not a version such as v2.0.2.1.")
+    return UpdateManifest(
+        version=_normalize_semver(tag),
+        released=str(data.get("published_at") or "")[:10],
+        url=_sanitize_url(data.get("html_url"), allowed_hosts=_UPDATE_ALLOWED_HOSTS) or fallback_url,
+        notes=_release_notes(data.get("body")),
+    )
 
 
 @dataclass(slots=True)
@@ -196,6 +228,7 @@ class PreparedUpdateVerification:
 
 @dataclass(slots=True)
 class PreparedUpdateInstall:
+    _preparation: PreparationLease | None = field(default=None, repr=False, compare=False, kw_only=True)
     latest_version: str
     setup_path: Path
     staging_root: Path
@@ -245,7 +278,14 @@ class SelfUpdater:
         if parse_semver(current_normalized) is None:
             current_normalized = "0.0.0"
 
-        manifest = self._fetch_manifest(stop_event=stop_event)
+        try:
+            manifest = self._fetch_manifest(stop_event=stop_event)
+        except HTTPError as error:
+            if error.code != 404:
+                raise
+            # GitHub answers 404 while the repository has no published release: there is
+            # nothing to offer yet, which is not a failure.
+            manifest = UpdateManifest(version="", url=self._page_url)
         update_available = is_newer_version(manifest.version, current_normalized)
         minimum_supported = normalize_version(manifest.minimum_supported_version) or "1.0.0"
         minimum_tuple = parse_semver(minimum_supported)
@@ -291,6 +331,7 @@ class SelfUpdater:
 
         _emit_progress(progress_callback, 0, "Preparing update...")
         target_root = self._create_staging_root()
+        protection = PreparationLease(target_root)
         try:
             setup_name = self._setup_filename_from_url(check_data.setup_url, check_data.latest_version)
             setup_path = target_root / setup_name
@@ -308,12 +349,14 @@ class SelfUpdater:
             _emit_progress(progress_callback, 100, "Verifying update package...")
             _emit_progress(progress_callback, 100, "Ready to install update.")
         except Exception:
-            self._remove_tree(target_root)
+            protection.close()
+            discard_staging(target_root, self._runtime_storage_dir)
             raise
         return PreparedUpdateInstall(
             latest_version=str(check_data.latest_version or ""),
             setup_path=setup_path,
             staging_root=target_root,
+            _preparation=protection,
             requires_elevation=(mode_arg == "/ALLUSERS"),
             verification=PreparedUpdateVerification(check_data.setup_sha256.lower(), check_data.setup_size),
             notes=tuple(check_data.notes),
@@ -349,15 +392,16 @@ class SelfUpdater:
                            current_version=self._app_version, notes=prepared.notes,
                            install_dir=self._install_dir, mode=self._installer_mode_arg(),
                            restart=restart_after_update, staging_root=prepared.staging_root)
+            if prepared._preparation is not None:
+                prepared._preparation.close()
         except Exception:
             self.discard_prepared_update(prepared)
             raise
 
     def discard_prepared_update(self, prepared: PreparedUpdateInstall) -> None:
-        try:
-            self._remove_tree(Path(prepared.staging_root))
-        except Exception:
-            return
+        if prepared._preparation is not None:
+            prepared._preparation.close()
+        discard_staging(Path(prepared.staging_root), self._runtime_storage_dir)
 
     def _create_staging_root(self) -> Path:
         self._runtime_storage_dir.mkdir(parents=True, exist_ok=True)
@@ -376,6 +420,10 @@ class SelfUpdater:
         data = json.loads(payload)
         if not isinstance(data, dict):
             raise RuntimeError("latest.json did not return a JSON object")
+        if "tag_name" in data:
+            return manifest_from_github_release(data, fallback_url=self._page_url)
+        # Not reached with GitHub's answer. What follows reads the original's latest.json and is
+        # left as it is so that changes of the original keep merging without conflicts.
 
         requested_channel = _normalize_channel(data.get("channel"), default=self._default_channel)
         selected_channel = requested_channel
@@ -504,6 +552,9 @@ class SelfUpdater:
             except RuntimeError:
                 raise
             except Exception as exc:
+                if isinstance(exc, HTTPError) and 400 <= exc.code < 500:
+                    # No release yet, or too many requests: asking again at once changes nothing.
+                    raise
                 last_error = exc
                 if attempt < attempts and delay_base > 0:
                     time.sleep(delay_base * attempt)
@@ -692,18 +743,7 @@ class SelfUpdater:
         return cleaned
 
     def _cleanup_old_payloads(self) -> None:
-        if not self._runtime_storage_dir.exists():
-            return
-        for child in self._runtime_storage_dir.iterdir():
-            if not child.is_dir() or not child.name.startswith(_UPDATE_STAGING_PREFIX):
-                continue
-            try:
-                age_seconds = max(0.0, time.time() - child.stat().st_mtime)
-            except Exception:
-                continue
-            if age_seconds < _UPDATE_STAGING_MAX_AGE_SECONDS:
-                continue
-            self._remove_tree(child)
+        maintain_updates(self._runtime_storage_dir)
 
     def _cleanup_legacy_updates_root(self) -> None:
         legacy_root = self._runtime_storage_dir / "updates"

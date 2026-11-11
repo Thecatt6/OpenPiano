@@ -14,6 +14,7 @@ from PySide6.QtGui import QDesktopServices, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from .ui.update_dialog import get_update_dialog, show_update_failure, show_update_notice
+from openpiano.core.audio_errors import AudioOutputError
 from openpiano.core.audio_engine import AudioEngineProtocol, FluidSynthAudioEngine, SilentAudioEngine
 from openpiano.core.audio_levels import normalize_volume
 from openpiano.core.preset_families import default_program_selection
@@ -32,6 +33,7 @@ from openpiano.core.config import (
     TRANSPOSE_MAX,
     TRANSPOSE_MIN,
     UPDATE_CHECK_MANIFEST_URL,
+    UPDATE_PAGE_URL,
     normalize_piano_style,
     normalize_ui_scale,
 )
@@ -52,21 +54,23 @@ from openpiano.core.keymap import (
     extract_custom_keybind_overrides,
     get_note_labels,
     normalize_mouse_binding,
-    normalize_key_event,
-    normalize_key_event_layout_scancode,
-    normalize_key_event_qwerty_scancode,
+    binding_reserved_reason,
+    normalize_key_event_physical,
+    normalize_scan_code,
+    is_keypad_scan_code,
+    refresh_keyboard_labels,
     serialize_custom_keybind_payload,
 )
 from openpiano.core.keybind_remap import (
     apply_overrides,
     build_default_keybind_map_full,
-    translate_keybind_map,
 )
 from openpiano.core.music_logic import clamp_transposed_note
 from openpiano.core.midi_input import MidiInputEvent, MidiInputManager
 from openpiano.core.midi_recording import MidiRecorder
 from openpiano.core.piano_pedal import PedalState
 from openpiano.core.plugin_host import PluginAudioEngine
+from openpiano.core.plugin_keys import notes_to_scan
 from openpiano.core.plugin_registry import is_plugin_instrument_id
 from openpiano.core.plugin_window import PluginWindowPlacer
 from openpiano.core.object_tree import is_descendant_of
@@ -78,10 +82,27 @@ from openpiano.core.settings_store import (
     load_settings,
     save_settings,
 )
-from openpiano.core.split import update_split_zone
+from openpiano.core.sound_presets import (
+    MAX_SOUND_PRESETS,
+    assign_pc_key,
+    assign_trigger,
+    clear_sound_preset,
+    describe_sound,
+    pc_key_label,
+    pc_key_refusal,
+    preset_index_for_pc_key,
+    preset_index_for_trigger,
+    rename_sound_preset,
+    store_sound_preset,
+    trigger_from_event,
+    trigger_label,
+)
+from openpiano.core.soundfont_keys import playable_keys, silent_notes
+from openpiano.core.split import normalize_split_zones, note_name, update_split_zone
 from openpiano.core.stats_logic import collect_stats_values, trim_kps_events
 from openpiano.core.theme import apply_key_color_overrides, get_theme
 from openpiano.services.midi_routing import MidiRoutingService
+from openpiano.services.keyboard_layout import KeyboardLayoutMonitor
 from openpiano.services.note_lifecycle import NoteLifecycleService
 from openpiano.services.audio_session import AudioSession
 from openpiano.services.main_thread import MainThreadInvoker
@@ -94,6 +115,18 @@ from openpiano.services.recording_export import (
     wav_export_args,
 )
 from openpiano.services.tutorial_flow import TutorialFlowService, TutorialStep
+from openpiano.ui.sound_presets_dialog import (
+    ACTION_CANCEL_LEARN,
+    ACTION_CLEAR,
+    ACTION_LEARN,
+    ACTION_LEARN_PC,
+    ACTION_RECALL,
+    ACTION_RENAME,
+    ACTION_STORE,
+    ACTION_UNASSIGN,
+    ACTION_UNASSIGN_PC,
+    SoundPresetRow,
+)
 from openpiano.services.update_check import UpdateCheckService, UpdateEndpoints
 from openpiano.services.update_payloads import (
     prepared_update_payload,
@@ -124,6 +157,7 @@ class PianoAppController(QObject):
     _recordingSaveReady = Signal(object)
     _pianoDownloadProgressReady = Signal(int, int)
     _pianoDownloadReady = Signal(object)
+    _pluginKeyScanReady = Signal(object)
 
     def __init__(
         self,
@@ -155,6 +189,14 @@ class PianoAppController(QObject):
         self._piano_download_installed = False
         self._pianoDownloadProgressReady.connect(self._on_piano_download_progress, Qt.ConnectionType.QueuedConnection)
         self._pianoDownloadReady.connect(self._finish_piano_download, Qt.ConnectionType.QueuedConnection)
+        # The silent keys known for each plug-in in use, by slot (-1 the main instrument, else
+        # the zone): the engine and the notes they were looked up for, and None when unknown.
+        self._plugin_key_cache: dict[int, tuple[object, range, frozenset[int] | None]] = {}
+        self._key_scan_stop: threading.Event | None = None
+        self._key_scan_jobs: list[tuple] = []
+        # Plug-ins whose sound was changed while their keys were being tried.
+        self._key_scan_outdated: set[int] = set()
+        self._pluginKeyScanReady.connect(self._finish_plugin_key_scan, Qt.ConnectionType.QueuedConnection)
         self._settings_save_error_shown = False
 
         report_startup("Loading saved preferences...")
@@ -189,9 +231,19 @@ class PianoAppController(QObject):
         self._black_key_pressed_color = settings.black_key_pressed_color
         self._window_x = settings.window_x
         self._window_y = settings.window_y
-        self._keyboard_input_mode = settings.keyboard_input_mode
-        self._keyboard_layout_choice_seen = bool(settings.keyboard_layout_choice_seen)
+        refresh_keyboard_labels()
         self._split_zones = settings.split_zones
+        self._sound_presets = settings.sound_presets
+        # The preset whose "Assign Key" is waiting for a key of the MIDI keyboard.
+        # The preset that waits for its key: one of the computer keyboard when
+        # _preset_learn_pc is set, one of the MIDI keyboard otherwise.
+        self._preset_learn_index: int | None = None
+        self._preset_learn_pc = False
+        # Shown at the bottom of the Sound Presets window until the next thing done there.
+        self._preset_notice = ""
+        # Plug-in settings a preset being recalled hands to the engines it makes load:
+        # slot -> (instrument id, settings). Read on the audio preparation threads.
+        self._staged_plugin_states: dict[str, tuple[str, bytes]] = {}
         # Plug-ins are created, edited and released on this (the main) thread.
         self._main_thread = MainThreadInvoker(self)
         if plugin_library is None:
@@ -213,19 +265,26 @@ class PianoAppController(QObject):
         self._mouse_button_bindings: dict[int, Binding] = {}
         self._ignore_mouse_until_release = False
         self._sustain_gate_percent = 0.0 if self._is_sustain_temporarily_off() else 100.0
-        self._default_keybind_map_full = build_default_keybind_map_full(self._keyboard_input_mode)
+        self._default_keybind_map_full = build_default_keybind_map_full()
         self._custom_keybind_overrides = deserialize_custom_keybind_payload(settings.custom_keybinds)
+        self._retained_legacy_keybinds = {
+            note: value for note, value in settings.custom_keybinds.items()
+            if value is not None and (
+                int(note) not in self._custom_keybind_overrides
+                or (self._custom_keybind_overrides[int(note)][0] == "keyboard"
+                    and not self._custom_keybind_overrides[int(note)][1].startswith("scan:"))
+            )
+        }
         self._keybind_committed_map_full = apply_overrides(
             self._default_keybind_map_full,
             self._custom_keybind_overrides,
         )
-        self._keybind_staging_map_full: dict[int, Binding] = dict(self._keybind_committed_map_full)
+        self._keybind_staging_map_full: dict[int, Binding | None] = dict(self._keybind_committed_map_full)
         self._keybind_edit_active = False
         self._keybind_selected_note: int | None = None
-        self._keybind_edit_undo_stack: list[tuple[int, Binding]] = []
-        self._keyboard_layout_prompt_active = False
+        self._keybind_edit_undo_stack: list[dict[int, Binding | None]] = []
 
-        self._mapping: dict[int, Binding] = {}
+        self._mapping: dict[int, Binding | None] = {}
         self._binding_to_notes: dict[Binding, tuple[int, ...]] = {}
         self._note_labels: dict[int, str] = {}
         self._keys: list[int] = []
@@ -311,7 +370,7 @@ class PianoAppController(QObject):
             app_version=APP_VERSION,
             endpoints=UpdateEndpoints(
                 manifest_url=UPDATE_CHECK_MANIFEST_URL,
-                page_url=OFFICIAL_WEBSITE_URL,
+                page_url=UPDATE_PAGE_URL,
             ),
         )
 
@@ -381,6 +440,7 @@ class PianoAppController(QObject):
         self._restore_midi_input_device(persist=False, show_warning=False)
 
         self._app.installEventFilter(self)
+        self._keyboard_layout_monitor = KeyboardLayoutMonitor(self._app, self, self._refresh_keyboard_layout)
         self.window.piano_widget.installEventFilter(self)
         self._app.aboutToQuit.connect(self.shutdown)
         self._refresh_stats_ui()
@@ -403,7 +463,7 @@ class PianoAppController(QObject):
         self.window.showKeyLabelsChanged.connect(self._on_show_key_labels_changed)
         self.window.showNoteLabelsChanged.connect(self._on_show_note_labels_changed)
         self.window.changeKeybindsRequested.connect(self._on_change_keybinds_requested)
-        self.window.changeKeyboardLayoutRequested.connect(self._on_change_keyboard_layout_requested)
+        self.window.resetKeybindsRequested.connect(self._on_reset_keybinds_requested)
         self.window.doneKeybindsRequested.connect(self._on_done_keybinds_requested)
         self.window.discardKeybindsRequested.connect(self._on_discard_keybinds_requested)
         self.window.keybindEditActionBlocked.connect(self._on_keybind_edit_action_blocked)
@@ -438,8 +498,10 @@ class PianoAppController(QObject):
         self.window.splitZoneChanged.connect(self._on_split_zone_changed)
         self.window.pluginRescanRequested.connect(self._on_plugin_rescan_requested)
         self.window.pluginFoldersRequested.connect(self._on_plugin_folders_requested)
+        self.window.soundPresetAction.connect(self._on_sound_preset_action)
         # Queued: the plug-in window keeps this slot busy for as long as it stays open.
         self.window.pluginEditorRequested.connect(self._on_plugin_editor_requested, Qt.ConnectionType.QueuedConnection)
+        self.window.pluginKeyScanRequested.connect(self._on_plugin_key_scan_requested)
 
         self.window.piano_widget.notePressed.connect(self._on_mouse_note_pressed)
         self.window.piano_widget.noteReleased.connect(self._on_mouse_note_released)
@@ -513,9 +575,14 @@ class PianoAppController(QObject):
             def unavailable():
                 raise RuntimeError("This plug-in is no longer installed.")
             return unavailable
+        options = {}
+        staged = self._staged_plugin_states.get(slot)
+        if staged is not None and staged[0] == instrument_id:
+            # A sound preset is being recalled: start from the settings it stored.
+            options["initial_state"] = staged[1]
         return lambda: self._plugin_engine_factory(
             plugin, invoker=self._main_thread, slot=slot,
-            state_store=library.state_store, load_guard=library.load_guard,
+            state_store=library.state_store, load_guard=library.load_guard, **options,
         )
 
     def _skip_plugins_interrupted_last_time(self) -> None:
@@ -585,8 +652,10 @@ class PianoAppController(QObject):
             self.window.set_instruments(self._instruments, self._instrument_id)
             self._refresh_program_controls()
             self._refresh_plugin_editor_button()
+            self._refresh_silent_keys()
             if self._audio_session.is_latest(result.request):
                 self._audio_request = None
+                self._staged_plugin_states.pop("main", None)
                 self.window.set_audio_loading('')
                 if result.request.persist:
                     self._schedule_persist()
@@ -618,9 +687,10 @@ class PianoAppController(QObject):
             return
         self._audio_handoff = False
         self._audio_request = None
+        self._staged_plugin_states.pop("main", None)
         self.window.set_audio_loading('')
         self.window.set_instruments(self._instruments, self._instrument_id)
-        if result.request.startup and not self._startup_fallback_attempted:
+        if result.request.startup and not self._startup_fallback_attempted and not isinstance(result.error, AudioOutputError):
             self._startup_fallback_attempted = True
             fallback = select_fallback_instrument(self._instruments)
             if fallback is not None and fallback.id != result.request.instrument_id:
@@ -658,7 +728,9 @@ class PianoAppController(QObject):
             return
         self._stop_all_notes(preserve_pedal=True)
         self.audio_available = False
-        self._audio_handoff = True
+        self.audio_engine = SilentAudioEngine()
+        self._audio_handoff = False
+        self._refresh_silent_keys()
         if self.window.ask_audio_retry(detail):
             self._retry_audio()
 
@@ -669,11 +741,14 @@ class PianoAppController(QObject):
             self._stop_all_notes(preserve_pedal=True)
         self._audio_handoff = True
         instrument = self._instrument_by_id.get(self._instrument_id)
-        if instrument is None or not callable(getattr(self.audio_engine, 'restart_output', None)):
+        if instrument is None or not self._audio_session.can_retry_output:
             fallback = instrument or select_fallback_instrument(self._instruments)
             if fallback is not None:
-                self._apply_instrument_selection(fallback.id, fallback.default_bank, fallback.default_preset,
-                    persist=False, startup=True)
+                bank = self._instrument_bank if instrument is not None else fallback.default_bank
+                preset = self._instrument_preset if instrument is not None else fallback.default_preset
+                self._apply_instrument_selection(fallback.id, bank, preset, persist=False, startup=True)
+            else:
+                self._audio_handoff = False
             return
         self._audio_request = self._audio_session.request(instrument.id, str(instrument.path),
             self._instrument_bank, self._instrument_preset, self._volume, retry=True)
@@ -893,6 +968,18 @@ class PianoAppController(QObject):
             return
         if event.sequence <= self._midi_sequence_cutoff or self._tutorial_active:
             return
+        trigger = trigger_from_event(event.kind, event.channel, event.note, event.value)
+        if trigger is not None:
+            # A key given to a sound preset switches sounds and plays no note.
+            if self._preset_learn_index is not None and not self._preset_learn_pc:
+                self._finish_preset_learn(trigger)
+                return
+            preset_index = preset_index_for_trigger(self._sound_presets, trigger)
+            if preset_index is not None:
+                self._recall_sound_preset(preset_index)
+                return
+        if event.kind in ('controller', 'program_change'):
+            return
         source = f'midi:{event.generation}:{event.channel}:{event.note}'
         if event.kind == 'note_on':
             if not self._audio_handoff:
@@ -1023,6 +1110,7 @@ class PianoAppController(QObject):
         self.window.set_instruments(self._instruments, self._instrument_id)
         self.window.set_split_instruments(self._instruments)
         self._configure_split_zones()
+        self._refresh_sound_presets_ui()
         self._piano_download_installed = any(is_hifi_piano(item) for item in self._instruments)
         if not self._piano_download_active:
             self.window.set_piano_download_state(
@@ -1167,6 +1255,8 @@ class PianoAppController(QObject):
             return False
         if self._instrument_id == "builtin:default.sf3":
             bank, preset = default_program_selection(bank, preset)
+        if not self.audio_available and self._instrument_id:
+            return self._apply_instrument_selection(self._instrument_id, bank, preset, persist)
         if not self._instrument_id:
             self._instrument_bank = max(0, min(16383, int(bank)))
             self._instrument_preset = max(0, min(127, int(preset)))
@@ -1196,9 +1286,186 @@ class PianoAppController(QObject):
         self._instrument_bank = int(current_bank)
         self._instrument_preset = int(current_preset)
         self._refresh_program_controls()
+        self._refresh_silent_keys()
         if persist:
             self._schedule_persist()
         return True
+
+    def _playable_keys_of(self, instrument_id: str, bank: int, preset: int) -> frozenset[int] | None:
+        """The notes a SoundFont instrument can play. None for a plug-in: its range cannot be
+        read, only found by playing it (_plugin_playable_keys)."""
+        instrument = self._instrument_by_id.get(instrument_id)
+        if instrument is None or instrument.source == "plugin" or is_plugin_instrument_id(instrument_id):
+            return None
+        return playable_keys(instrument.path, bank, preset)
+
+    def _plugin_key_slots(self) -> list[tuple[int, object, str, range]]:
+        """The plug-ins that are playing: slot (-1 the main instrument, else the zone), engine,
+        instrument and the notes the keyboard reaches in it."""
+        slots: list[tuple[int, object, str, range]] = []
+        if (self.audio_available and self._instrument_id
+                and callable(getattr(self.audio_engine, 'find_silent_keys', None))):
+            slots.append((-1, self.audio_engine, self._instrument_id, notes_to_scan()))
+        for index, zone in enumerate(self._split_zones):
+            state = self._split_manager.state(index)
+            if not (zone.enabled and state.status == "ready" and state.instrument_id == zone.instrument_id):
+                continue
+            engine = self._split_manager.engine(index)
+            if callable(getattr(engine, 'find_silent_keys', None)):
+                slots.append((index, engine, state.instrument_id, notes_to_scan(zone.octave)))
+        return slots
+
+    def _plugin_playable_keys(self, index: int, engine, instrument_id: str, notes: range) -> frozenset[int] | None:
+        """The notes a plug-in plays, when its keys have been tried with the sound it has now."""
+        cached = self._plugin_key_cache.get(index)
+        if cached is None or cached[0] is not engine or cached[1] != notes:
+            silent = None
+            store = getattr(self._plugin_library, 'key_store', None)
+            capture = getattr(engine, 'capture_state', None)
+            if store is not None and callable(capture) and not getattr(engine, 'key_scan_running', False):
+                try:
+                    silent = store.get(instrument_id, capture(), notes)
+                except Exception:
+                    silent = None
+            cached = (engine, notes, silent)
+            self._plugin_key_cache[index] = cached
+        silent = cached[2]
+        return None if silent is None else frozenset(range(128)) - silent
+
+    def _forget_plugin_keys(self, engine) -> None:
+        """The sound of this plug-in may have changed: what was known of its keys is looked up again."""
+        for index in [index for index, cached in self._plugin_key_cache.items() if cached[0] is engine]:
+            del self._plugin_key_cache[index]
+        if self._key_scan_stop is not None:
+            self._key_scan_outdated.add(id(engine))
+
+    def _refresh_silent_keys(self) -> None:
+        """Shows in gray the keys that the main sound and the split zones cannot play."""
+        plugins = {index: slot for index, *slot in self._plugin_key_slots()}
+        for index in [index for index in self._plugin_key_cache if index not in plugins]:
+            del self._plugin_key_cache[index]
+        main_keys = None
+        if -1 in plugins:
+            main_keys = self._plugin_playable_keys(-1, *plugins[-1])
+        elif self.audio_available and self._instrument_id:
+            main_keys = self._playable_keys_of(self._instrument_id, self._instrument_bank, self._instrument_preset)
+        zone_keys: list[frozenset[int] | None] = []
+        for index, zone in enumerate(self._split_zones):
+            state = self._split_manager.state(index)
+            if index in plugins:
+                zone_keys.append(self._plugin_playable_keys(index, *plugins[index]))
+                continue
+            loaded = (zone.enabled and state.status == "ready" and not state.is_plugin
+                      and state.instrument_id == zone.instrument_id)
+            zone_keys.append(self._playable_keys_of(state.instrument_id, state.bank, state.preset) if loaded else None)
+        self.window.piano_widget.set_silent_notes(silent_notes(main_keys, self._split_zones, zone_keys))
+        self.window.set_plugin_key_scan_state(bool(plugins), self._key_scan_stop is not None)
+
+    def _plugin_slot_name(self, index: int, engine) -> str:
+        name = str(getattr(engine, 'plugin_name', '') or '').strip() or "Plug-in"
+        return f"{name} (main instrument)" if index < 0 else f"{name} (zone {index + 1})"
+
+    def _on_plugin_key_scan_requested(self) -> None:
+        """Find Silent Keys: try every key of the plug-ins in use and show the silent ones in gray."""
+        if self._is_shutdown or self._key_scan_stop is not None:
+            return
+        slots = self._plugin_key_slots()
+        if not slots:
+            self.window.show_info(
+                "Find Silent Keys",
+                "No plug-in is playing right now.\n\n"
+                "The keys a SoundFont cannot play are shown in gray by themselves.")
+            return
+        if any(getattr(engine, 'editor_open', False) for _index, engine, _id, _notes in slots):
+            self.window.show_info("Find Silent Keys", "Close the plug-in's window first, then try again.")
+            return
+        self._stop_all_notes(preserve_pedal=True)
+        jobs = []
+        for index, engine, instrument_id, notes in slots:
+            capture = getattr(engine, 'capture_state', None)
+            jobs.append((index, engine, instrument_id, notes, capture() if callable(capture) else None))
+        stop = threading.Event()
+        self._key_scan_stop = stop
+        self._key_scan_jobs = jobs
+        self._key_scan_outdated = set()
+        self.window.set_plugin_key_scan_state(True, True)
+        threading.Thread(target=self._run_plugin_key_scan, args=(jobs, stop),
+                         name="plugin-key-scan", daemon=True).start()
+
+    def _run_plugin_key_scan(self, jobs: list[tuple], stop: threading.Event) -> None:
+        results = []
+        for index, engine, instrument_id, notes, before in jobs:
+            found = None
+            if not stop.is_set():
+                try:
+                    found = engine.find_silent_keys(notes, cancel=stop)
+                except Exception:
+                    found = None
+            results.append((index, engine, instrument_id, notes, before, found))
+        try:
+            self._pluginKeyScanReady.emit((stop, results))
+        except RuntimeError:
+            # The application is gone.
+            pass
+
+    def _cancel_plugin_key_scan(self) -> None:
+        stop, self._key_scan_stop = self._key_scan_stop, None
+        jobs, self._key_scan_jobs = self._key_scan_jobs, []
+        if stop is None:
+            return
+        stop.set()
+        for _index, engine, *_rest in jobs:
+            stopper = getattr(engine, 'stop_key_scan', None)
+            if callable(stopper):
+                stopper()
+
+    def _finish_plugin_key_scan(self, payload: object) -> None:
+        stop, results = payload
+        if stop is not self._key_scan_stop:
+            return
+        self._key_scan_stop = None
+        self._key_scan_jobs = []
+        outdated, self._key_scan_outdated = self._key_scan_outdated, set()
+        if self._is_shutdown:
+            return
+        store = getattr(self._plugin_library, 'key_store', None)
+        playing = {id(engine): (index, notes) for index, engine, _id, notes in self._plugin_key_slots()}
+        lines: list[str] = []
+        for index, engine, instrument_id, notes, before, found in results:
+            name = self._plugin_slot_name(index, engine)
+            if playing.get(id(engine)) != (index, notes) or id(engine) in outdated:
+                # What is remembered for the sound it has now is looked up again below.
+                self._plugin_key_cache.pop(index, None)
+                lines.append(f"{name}: its sound or its zone was changed meanwhile, so the result was dropped.")
+                continue
+            if found is None:
+                self._plugin_key_cache.pop(index, None)
+                lines.append(f"{name}: no key gave any sound, so nothing new is known. "
+                             "If the plug-in was still loading its sounds, try again when it is ready.")
+                continue
+            capture = getattr(engine, 'capture_state', None)
+            after = capture() if callable(capture) else None
+            if store is not None:
+                # Filed under the settings before and after: playing the keys can change them.
+                for state in dict.fromkeys((before, after)):
+                    try:
+                        store.put(instrument_id, state, notes, found.silent)
+                    except Exception:
+                        pass
+            self._plugin_key_cache[index] = (engine, notes, found.silent)
+            count, tried = len(found.silent), len(notes)
+            if count:
+                line = f"{name}: {count} of the {tried} keys tried give{'s' if count == 1 else ''} no sound."
+            elif found.undecided:
+                line = f"{name}: none of the {tried} keys tried is known to be silent."
+            else:
+                line = f"{name}: all {tried} keys tried give sound."
+            if found.undecided:
+                line += (f" {found.undecided}{' more' if count else ''} could not be told apart from notes"
+                         " still ringing and are shown as playing.")
+            lines.append(line)
+        self._refresh_silent_keys()
+        self.window.show_info("Find Silent Keys", "\n\n".join(lines))
 
     def _configure_split_zones(self) -> None:
         self.window.set_split_zones(self._split_zones)
@@ -1207,6 +1474,7 @@ class PianoAppController(QObject):
         self._split_manager.configure(self._split_zones, self._instrument_by_id, self._volume)
         for index in range(len(self._split_zones)):
             self.window.set_split_zone_state(index, self._split_manager.state(index))
+        self._refresh_silent_keys()
 
     def _on_split_zone_changed(self, index: int, changes: object) -> None:
         if self._is_shutdown or not isinstance(changes, dict):
@@ -1245,12 +1513,300 @@ class PianoAppController(QObject):
             self._split_zones = update_split_zone(self._split_zones, index, bank=state.bank, preset=state.preset)
             self._schedule_persist()
         self.window.set_split_zone_state(index, state)
+        self._refresh_silent_keys()
+        if state.status != "loading":
+            self._staged_plugin_states.pop(f"zone{index + 1}", None)
         if index == self._pending_zone_editor and state.status != "loading":
             self._pending_zone_editor = None
             if state.status == "ready" and state.is_plugin and state.instrument_id == zone.instrument_id:
                 # Through the queue, like a click: the plug-in window keeps its caller busy
                 # for as long as it stays open.
                 self.window.pluginEditorRequested.emit(index)
+
+    # ----- Sound presets: stored sounds, each recalled by a key of the MIDI keyboard.
+
+    def _refresh_sound_presets_ui(self) -> None:
+        rows = [
+            SoundPresetRow(stored=preset.stored, name=preset.name, summary=preset.summary,
+                           key=trigger_label(preset.trigger), pc_key=pc_key_label(preset.pc_key))
+            for preset in self._sound_presets
+        ]
+        self.window.set_sound_presets(rows, self._preset_learn_index, self._preset_learn_pc,
+                                      self._preset_notice)
+        self.window.piano_widget.set_preset_keys(
+            preset.pc_key for preset in self._sound_presets if preset.stored and preset.pc_key is not None)
+
+    def _stop_preset_learn(self) -> int | None:
+        """No preset waits for a key any more. Returns the one that did."""
+        index, self._preset_learn_index = self._preset_learn_index, None
+        self._preset_learn_pc = False
+        self._preset_notice = ""
+        return index
+
+    def _on_sound_preset_action(self, action: str, index: int, text: str) -> None:
+        index = int(index)
+        if self._is_shutdown or not 0 <= index < MAX_SOUND_PRESETS:
+            return
+        if action == ACTION_CANCEL_LEARN:
+            if self._stop_preset_learn() is not None:
+                self._refresh_sound_presets_ui()
+            return
+        if self._tutorial_active:
+            return
+        self._preset_notice = ""
+        if action == ACTION_STORE:
+            self._store_sound_preset(index)
+        elif action == ACTION_RECALL:
+            self._recall_sound_preset(index, interactive=True)
+        elif action == ACTION_CLEAR:
+            self._clear_sound_preset(index)
+        elif action == ACTION_RENAME:
+            self._set_sound_presets(rename_sound_preset(self._sound_presets, index, text))
+        elif action == ACTION_UNASSIGN:
+            self._set_sound_presets(assign_trigger(self._sound_presets, index, None))
+        elif action == ACTION_UNASSIGN_PC:
+            self._set_sound_presets(assign_pc_key(self._sound_presets, index, None))
+        elif action == ACTION_LEARN_PC:
+            if not self._sound_presets[index].stored:
+                return
+            self._stop_preset_learn()
+            self._preset_learn_index = index
+            self._preset_learn_pc = True
+            self._refresh_sound_presets_ui()
+        elif action == ACTION_LEARN:
+            if not self._sound_presets[index].stored:
+                return
+            self._stop_preset_learn()
+            self._preset_learn_index = index
+            self._refresh_sound_presets_ui()
+            if not self._midi_manager.current_device():
+                self.window.show_warning(
+                    "Sound Presets",
+                    "No MIDI keyboard is connected to OpenPiano yet.\n"
+                    "Choose it under Controls, \"MIDI In\", then press the key to assign.")
+
+    def _set_sound_presets(self, presets) -> None:
+        if self._preset_learn_index is not None and not presets[self._preset_learn_index].stored:
+            self._stop_preset_learn()
+        changed = presets != self._sound_presets
+        self._sound_presets = presets
+        self._refresh_sound_presets_ui()
+        if changed:
+            self._schedule_persist()
+
+    def _finish_preset_learn(self, trigger) -> None:
+        index = self._stop_preset_learn()
+        if index is None:
+            return
+        self._set_sound_presets(assign_trigger(self._sound_presets, index, trigger))
+
+    def _handle_preset_learn_key(self, event: QKeyEvent) -> bool:
+        """A key of the computer keyboard pressed while a preset waits for one. Every key is
+        taken here, whichever window of OpenPiano it was pressed in."""
+        if event.isAutoRepeat():
+            return True
+        key = int(event.key())
+        if key == int(Qt.Key.Key_Escape):
+            self._stop_preset_learn()
+            self._refresh_sound_presets_ui()
+            return True
+        if key in {int(Qt.Key.Key_Control), int(Qt.Key.Key_Shift), int(Qt.Key.Key_Alt),
+                   int(Qt.Key.Key_AltGr), int(Qt.Key.Key_Meta)}:
+            # Held for a combination: the key it goes with is still to come.
+            return True
+        binding = self._binding_from_key_event(event)
+        reason = pc_key_refusal(binding)
+        if reason:
+            self._preset_notice = reason
+            self._refresh_sound_presets_ui()
+            return True
+        index = self._stop_preset_learn()
+        if index is None:
+            return True
+        presets = assign_pc_key(self._sound_presets, index, binding)
+        if presets[index].pc_key == binding:
+            self._preset_notice = f"“{pc_key_label(binding)}” now recalls “{presets[index].name}”."
+            notes = self._binding_to_notes.get(binding, ())
+            if notes:
+                # Nearly every key of the computer keyboard plays a note until it is given away.
+                self._preset_notice += f" It no longer plays {note_name(notes[0])}."
+        self._set_sound_presets(presets)
+        return True
+
+    def _recall_preset_for_key_event(self, event: QKeyEvent) -> bool:
+        """Recall the preset a key of the computer keyboard was given to. True when the key
+        belongs to a preset: it then switches sounds and plays no note."""
+        binding = self._binding_from_key_event(event)
+        index = preset_index_for_pc_key(self._sound_presets, binding)
+        if index is None:
+            return False
+        if not event.isAutoRepeat():
+            self._recall_sound_preset(index)
+        return True
+
+    def _instrument_display_name(self, instrument_id: str) -> str:
+        instrument = self._instrument_by_id.get(instrument_id)
+        if instrument is not None:
+            return instrument.name
+        return self._plugin_display_name(instrument_id) if is_plugin_instrument_id(instrument_id) else ""
+
+    def _describe_current_sound(self) -> str:
+        program = ""
+        if not is_plugin_instrument_id(self._instrument_id):
+            program = self._available_program_names.get(self._instrument_bank, {}).get(self._instrument_preset, "")
+        zone_names: list[str] = []
+        for index, zone in enumerate(self._split_zones):
+            name = self._instrument_display_name(zone.instrument_id)
+            state = self._split_manager.state(index)
+            if zone.enabled and state.status == "ready" and not state.is_plugin:
+                zone_program = state.program_names.get(zone.bank, {}).get(zone.preset, "")
+                if zone_program:
+                    name = f"{name} – {zone_program}"
+            zone_names.append(name)
+        return describe_sound(self._instrument_display_name(self._instrument_id), str(program or ""),
+                              self._split_zones, zone_names)
+
+    @staticmethod
+    def _preset_state_slot(index: int, slot: str) -> str:
+        return f"preset{int(index) + 1:02d}{slot}"
+
+    def _plugin_state_store(self):
+        return getattr(self._plugin_library, "state_store", None)
+
+    def _clear_preset_plugin_states(self, index: int) -> None:
+        store = self._plugin_state_store()
+        if store is None:
+            return
+        for slot in ("main", *(f"zone{number + 1}" for number in range(len(self._split_zones)))):
+            store.clear_slot(self._preset_state_slot(index, slot))
+
+    def _capture_preset_plugin_states(self, index: int) -> None:
+        """A plug-in chooses its sound in its own window, so a preset keeps a copy of the
+        settings of every plug-in it uses, taken now."""
+        store = self._plugin_state_store()
+        if store is None:
+            return
+        self._clear_preset_plugin_states(index)
+        preset = self._sound_presets[index]
+        slots: list[tuple[str, str, object]] = []
+        if is_plugin_instrument_id(preset.instrument_id):
+            slots.append(("main", preset.instrument_id, self.audio_engine))
+        for zone_index, zone in enumerate(preset.zones):
+            if not zone.enabled or not is_plugin_instrument_id(zone.instrument_id):
+                continue
+            state = self._split_manager.state(zone_index)
+            loaded = state.status == "ready" and state.instrument_id == zone.instrument_id
+            slots.append((f"zone{zone_index + 1}", zone.instrument_id,
+                          self._split_manager.engine(zone_index) if loaded else None))
+        for slot, instrument_id, engine in slots:
+            capture = getattr(engine, "capture_state", None)
+            data = capture() if callable(capture) else None
+            if not data:
+                # Not loaded right now: what it last saved for this place is the best there is.
+                data = store.load(slot, instrument_id)
+            if data:
+                store.save(self._preset_state_slot(index, slot), instrument_id, data)
+
+    def _preset_plugin_state(self, index: int, slot: str, instrument_id: str) -> bytes | None:
+        store = self._plugin_state_store()
+        if store is None or not is_plugin_instrument_id(instrument_id):
+            return None
+        return store.load(self._preset_state_slot(index, slot), instrument_id)
+
+    def _load_plugin_state(self, engine, data: bytes) -> None:
+        loader = getattr(engine, "load_state", None)
+        if not callable(loader):
+            return
+        self._stop_all_notes(preserve_pedal=True)
+        try:
+            loader(data)
+        except Exception as exc:
+            _ = exc
+        self._forget_plugin_keys(engine)
+        self._refresh_silent_keys()
+
+    def _store_sound_preset(self, index: int) -> None:
+        if self._audio_request is not None or self._audio_handoff:
+            self.window.show_warning("Sound Presets", "The instrument is still loading. Store the preset once it is ready.")
+            return
+        if not self._instrument_id:
+            self.window.show_warning("Sound Presets", "There is no sound to store yet. Choose an instrument first.")
+            return
+        presets = store_sound_preset(
+            self._sound_presets, index,
+            instrument_id=self._instrument_id, bank=self._instrument_bank, preset=self._instrument_preset,
+            zones=self._split_zones, summary=self._describe_current_sound())
+        self._sound_presets = presets
+        self._capture_preset_plugin_states(index)
+        self._refresh_sound_presets_ui()
+        self._schedule_persist()
+
+    def _clear_sound_preset(self, index: int) -> None:
+        self._clear_preset_plugin_states(index)
+        self._set_sound_presets(clear_sound_preset(self._sound_presets, index))
+
+    def _recall_sound_preset(self, index: int, *, interactive: bool = False) -> bool:
+        """Switch to a stored sound: the main instrument, then the keyboard split."""
+        if (self._is_shutdown or self._tutorial_active or not 0 <= index < len(self._sound_presets)
+                or self._audio_session.terminal_error is not None):
+            return False
+        preset = self._sound_presets[index]
+        if not preset.stored:
+            return False
+        self._pending_zone_editor = None
+        self._pending_plugin_instrument_id = ""
+        self._staged_plugin_states.clear()
+
+        instrument = self._instrument_by_id.get(preset.instrument_id)
+        if instrument is not None:
+            state = self._preset_plugin_state(index, "main", instrument.id)
+            settled = self._audio_request is None and not self._audio_handoff
+            if settled and instrument.id == self._instrument_id:
+                # Already loaded: only the sound inside it may differ.
+                if state is not None:
+                    self._load_plugin_state(self.audio_engine, state)
+                elif (not is_plugin_instrument_id(instrument.id)
+                        and (preset.bank, preset.preset) != (self._instrument_bank, self._instrument_preset)):
+                    self._apply_program_selection(preset.bank, preset.preset, persist=False)
+            else:
+                if state is not None:
+                    self._staged_plugin_states["main"] = (instrument.id, state)
+                self._apply_instrument_selection(instrument.id, preset.bank, preset.preset, persist=True)
+
+        zones = normalize_split_zones(preset.zones)
+        reload_zones: list[int] = []
+        live_zones: list[tuple[int, bytes]] = []
+        for zone_index, zone in enumerate(zones):
+            slot = f"zone{zone_index + 1}"
+            state = self._preset_plugin_state(index, slot, zone.instrument_id) if zone.enabled else None
+            if state is None:
+                continue
+            current = self._split_manager.state(zone_index)
+            same_plugin = self._split_zones[zone_index].enabled and current.instrument_id == zone.instrument_id
+            if same_plugin and current.status == "ready" and self._split_manager.engine(zone_index) is not None:
+                live_zones.append((zone_index, state))
+                continue
+            self._staged_plugin_states[slot] = (zone.instrument_id, state)
+            if same_plugin and current.status == "loading":
+                # It may have read its settings already; load it again from the preset's.
+                reload_zones.append(zone_index)
+        self._split_zones = zones
+        self._configure_split_zones()
+        for zone_index in reload_zones:
+            self._split_manager.retry(zone_index, self._instrument_by_id)
+        for zone_index, state in live_zones:
+            engine = self._split_manager.engine(zone_index)
+            if engine is not None:
+                self._load_plugin_state(engine, state)
+        self._schedule_persist()
+
+        if interactive and instrument is None:
+            name = self._instrument_display_name(preset.instrument_id) or "its instrument"
+            self.window.show_warning(
+                "Sound Presets",
+                f"“{preset.name}” uses {name}, which is not available any more. "
+                "The main sound was left as it is.")
+        return True
 
     def _zone_plugin_window_ready(self, index: int) -> bool:
         """True when the zone's plug-in is loaded and its window can be opened now. If it is
@@ -1322,6 +1878,10 @@ class PianoAppController(QObject):
         opener = getattr(engine, 'open_editor', None)
         if not callable(opener) or getattr(engine, 'editor_open', False):
             return
+        if getattr(engine, 'key_scan_running', False):
+            self.window.show_info("Plug-in", "The keys of this plug-in are being tried right now. "
+                                             "Open its window when that has finished.")
+            return
         # The plug-in window runs its own loop until it is closed. On Windows that loop also
         # serves this application; elsewhere it has to be kept alive from here.
         keep_alive = None if sys.platform == 'win32' else QApplication.processEvents
@@ -1339,6 +1899,11 @@ class PianoAppController(QObject):
         except Exception as exc:
             if not self._is_shutdown:
                 self.window.show_warning("Plug-in", f"The plug-in window could not be opened.\n\n{exc}")
+        if not self._is_shutdown:
+            # The sound may have been changed in the window: its silent keys are known only if
+            # they were found for these settings before.
+            self._forget_plugin_keys(engine)
+            self._refresh_silent_keys()
 
     def _plugin_window_title(self, engine, index: int) -> str:
         name = str(getattr(engine, 'plugin_name', '') or '').strip() or "Plug-in"
@@ -1370,7 +1935,7 @@ class PianoAppController(QObject):
         self,
         mode: PianoMode,
         persist: bool,
-        mapping_full: dict[int, Binding] | None = None,
+        mapping_full: dict[int, Binding | None] | None = None,
     ) -> None:
         self._mode = mode
         full_map = mapping_full if mapping_full is not None else self._keybind_committed_map_full
@@ -1525,13 +2090,20 @@ class PianoAppController(QObject):
         self._apply_mode(self._mode, persist=False, mapping_full=self._keybind_staging_map_full)
         self.window.piano_widget.set_label_visibility(True, self._show_note_labels)
         self._set_keybind_editor_status(
-            "Select a key on the piano, then press a keyboard combo or mouse combo. Press Save or Discard when finished. Ctrl+Z undoes the last change.",
+            "Select a piano key, then press a keyboard or mouse combination. Delete clears its binding. Ctrl+Z undoes the last change. Choose Save or Discard when finished.",
         )
         self.window.piano_widget.setFocus()
 
     def _on_done_keybinds_requested(self) -> None:
         if not self._keybind_edit_active:
             return
+        changed_notes = {
+            note for note, binding in self._keybind_staging_map_full.items()
+            if binding != self._keybind_committed_map_full.get(note)
+        }
+        changed_notes.update(note for change in self._keybind_edit_undo_stack for note in change)
+        for note in changed_notes:
+            self._retained_legacy_keybinds.pop(str(note), None)
         self._keybind_committed_map_full = dict(self._keybind_staging_map_full)
         self._custom_keybind_overrides = extract_custom_keybind_overrides(
             self._default_keybind_map_full,
@@ -1539,6 +2111,31 @@ class PianoAppController(QObject):
         )
         self._finish_keybind_edit("")
         self._persist_settings_now()
+
+    def _on_reset_keybinds_requested(self) -> None:
+        if self._tutorial_active:
+            return
+        if not self._keybind_edit_active:
+            self._on_change_keybinds_requested()
+        pending_edits = {note for change in self._keybind_edit_undo_stack for note in change}
+        previous = {
+            note: self._keybind_staging_map_full[note]
+            for note, default in self._default_keybind_map_full.items()
+            if self._keybind_staging_map_full[note] != default
+            or (str(note) in self._retained_legacy_keybinds and note not in pending_edits)
+        }
+        if previous:
+            self._keybind_edit_undo_stack.append(previous)
+            self._keybind_staging_map_full = dict(self._default_keybind_map_full)
+            self._apply_mode(self._mode, persist=False, mapping_full=self._keybind_staging_map_full)
+            self.window.piano_widget.set_keybind_edit_mode(True, self._keybind_selected_note)
+        self._set_keybind_editor_status(
+            "All 61-key and 88-key bindings are set to defaults. Choose Save to apply or Discard to cancel. Ctrl+Z undoes the reset."
+            if previous else
+            "All 61-key and 88-key bindings already use defaults. Choose Save or Discard when finished.",
+        )
+        self.window.ensure_settings_target_visible(self.window.keybind_hint_label)
+        self.window.piano_widget.setFocus()
 
     def _on_discard_keybinds_requested(self) -> None:
         if not self._keybind_edit_active:
@@ -1564,32 +2161,42 @@ class PianoAppController(QObject):
         self.window.piano_widget.set_selected_keybind_note(self._keybind_selected_note)
         note_label = self._note_labels.get(self._keybind_selected_note, f"MIDI {self._keybind_selected_note}")
         binding = self._keybind_staging_map_full.get(self._keybind_selected_note)
-        binding_label = binding_to_inline_label(binding) if binding is not None else "None"
+        binding_label = binding_to_inline_label(binding) if binding is not None else "Unassigned"
+        if str(note) in self._retained_legacy_keybinds and not any(
+            note in change for change in self._keybind_edit_undo_stack
+        ):
+            self._set_keybind_editor_status(
+                f"{note_label}: the older binding could not be matched to a physical key. Press a new combination, or Delete to clear it.",
+            )
+            return
+        preset_index = preset_index_for_pc_key(self._sound_presets, binding)
+        if preset_index is not None:
+            binding_label += f" (recalls the sound preset “{self._sound_presets[preset_index].name}” instead)"
         self._set_keybind_editor_status(
-            f"{note_label} selected. Press a combo to assign. Current: {binding_label}",
+            f"{note_label} selected. Press a combination to assign, or Delete to clear. Current: {binding_label}",
         )
 
-    def _assign_binding_to_selected_note(self, binding: Binding) -> bool:
+    def _assign_binding_to_selected_note(self, binding: Binding | None) -> bool:
         if not self._keybind_edit_active or self._keybind_selected_note is None:
             return False
         target_note = int(self._keybind_selected_note)
         if target_note not in self._keybind_staging_map_full:
             return False
         previous_binding = self._keybind_staging_map_full[target_note]
-        if binding == previous_binding:
+        if binding == previous_binding and str(target_note) not in self._retained_legacy_keybinds:
             note_label = self._note_labels.get(target_note, f"MIDI {target_note}")
-            binding_label = binding_to_inline_label(binding)
+            binding_label = binding_to_inline_label(binding) if binding is not None else "Unassigned"
             self._set_keybind_editor_status(
                 f"{note_label} is already mapped to {binding_label}. Select another key or click Save/Discard.",
             )
             return True
-        self._keybind_edit_undo_stack.append((target_note, previous_binding))
+        self._keybind_edit_undo_stack.append({target_note: previous_binding})
         self._keybind_staging_map_full[target_note] = binding
         self._apply_mode(self._mode, persist=False, mapping_full=self._keybind_staging_map_full)
         self.window.piano_widget.set_keybind_edit_mode(True, target_note)
         self.window.piano_widget.set_selected_keybind_note(target_note)
         note_label = self._note_labels.get(target_note, f"MIDI {target_note}")
-        binding_label = binding_to_inline_label(binding)
+        binding_label = binding_to_inline_label(binding) if binding is not None else "Unassigned"
         self._set_keybind_editor_status(
             f"{note_label} mapped to {binding_label}. Select another key or click Save/Discard.",
         )
@@ -1601,14 +2208,20 @@ class PianoAppController(QObject):
         if not self._keybind_edit_undo_stack:
             self._set_keybind_editor_status("No keybind changes to undo. Press Save or Discard.")
             return True
-        note, previous_binding = self._keybind_edit_undo_stack.pop()
-        self._keybind_selected_note = int(note)
-        self._keybind_staging_map_full[self._keybind_selected_note] = previous_binding
+        previous = self._keybind_edit_undo_stack.pop()
+        self._keybind_staging_map_full.update(previous)
+        note = next(iter(previous))
+        if len(previous) == 1 and note in self._mapping:
+            self._keybind_selected_note = note
         self._apply_mode(self._mode, persist=False, mapping_full=self._keybind_staging_map_full)
         self.window.piano_widget.set_keybind_edit_mode(True, self._keybind_selected_note)
         self.window.piano_widget.set_selected_keybind_note(self._keybind_selected_note)
-        note_label = self._note_labels.get(self._keybind_selected_note, f"MIDI {self._keybind_selected_note}")
-        binding_label = binding_to_inline_label(previous_binding)
+        if len(previous) > 1:
+            self._set_keybind_editor_status("Reset undone. Previous bindings restored. Choose Save or Discard when finished.")
+            return True
+        note_label = self._note_labels.get(note, f"MIDI {note}")
+        previous_binding = previous[note]
+        binding_label = binding_to_inline_label(previous_binding) if previous_binding is not None else "Unassigned"
         self._set_keybind_editor_status(
             f"Undo applied. {note_label} reverted to {binding_label}. Press Save or Discard when finished.",
         )
@@ -2053,12 +2666,14 @@ class PianoAppController(QObject):
         self._black_key_pressed_color = defaults.black_key_pressed_color
         self._window_x = defaults.window_x
         self._window_y = defaults.window_y
-        self._keyboard_input_mode = defaults.keyboard_input_mode
-        self._keyboard_layout_choice_seen = defaults.keyboard_layout_choice_seen
         self._split_zones = defaults.split_zones
+        # Stored sound presets are kept: they are the user's work, not a setting.
+        self._stop_preset_learn()
+        self._staged_plugin_states.clear()
         self._pending_plugin_instrument_id = ""
-        self._default_keybind_map_full = build_default_keybind_map_full(self._keyboard_input_mode)
+        self._default_keybind_map_full = build_default_keybind_map_full()
         self._custom_keybind_overrides = {}
+        self._retained_legacy_keybinds = {}
         self._keybind_committed_map_full = dict(self._default_keybind_map_full)
         self._keybind_staging_map_full = dict(self._default_keybind_map_full)
         self._keybind_edit_active = False
@@ -2101,14 +2716,14 @@ class PianoAppController(QObject):
             return
         if self._ignore_mouse_until_release:
             return
-        if self._tutorial_active or self._keybind_edit_active or self._keyboard_layout_prompt_active:
+        if self._tutorial_active or self._keybind_edit_active:
             return
         self._current_mouse_base_note = int(base_note)
         self._activate_mouse_source(self._current_mouse_base_note)
 
     def _on_mouse_note_released(self, _base_note: int) -> None:
         self._ignore_mouse_until_release = False
-        if self._tutorial_active or self._keybind_edit_active or self._keyboard_layout_prompt_active:
+        if self._tutorial_active or self._keybind_edit_active:
             return
         self._release_mouse_source()
 
@@ -2117,7 +2732,7 @@ class PianoAppController(QObject):
             self._ignore_mouse_until_release = False
         if self._audio_handoff or self._ignore_mouse_until_release:
             return
-        if self._tutorial_active or self._keybind_edit_active or self._keyboard_layout_prompt_active:
+        if self._tutorial_active or self._keybind_edit_active:
             return
         if base_note is None:
             self._current_mouse_base_note = None
@@ -2180,7 +2795,7 @@ class PianoAppController(QObject):
         return is_descendant_of(focus, self.window)
 
     def _should_route_piano_key_event(self, event: QKeyEvent) -> bool:
-        if self._tutorial_active or self._keybind_edit_active or self._keyboard_layout_prompt_active:
+        if self._tutorial_active or self._keybind_edit_active:
             return True
         if int(event.key()) in {int(Qt.Key.Key_Tab), int(Qt.Key.Key_Backtab)}:
             return False
@@ -2191,6 +2806,8 @@ class PianoAppController(QObject):
         return focus is None or focus is self.window or focus is self.window.piano_widget
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:              
+        if event.type() == QEvent.ApplicationActivate:
+            self._refresh_keyboard_layout()
         if watched is self.window and event.type() == QEvent.Close:
             self.shutdown()
             return False
@@ -2227,11 +2844,18 @@ class PianoAppController(QObject):
                     return True
 
         if event.type() == QEvent.KeyPress:
+            if (self._preset_learn_index is not None and self._preset_learn_pc and isinstance(event, QKeyEvent)
+                    and QApplication.activeModalWidget() is None and QApplication.activePopupWidget() is None):
+                return self._handle_preset_learn_key(event)
             if not self._is_main_window_key_context(watched):
                 return super().eventFilter(watched, event)
             key_event = event                            
             if isinstance(key_event, QKeyEvent):
                 if not self._should_route_piano_key_event(key_event):
+                    # The Sound Presets window in front: its keys still recall their presets.
+                    if (self.window.sound_presets_window_active() and not self._keybind_edit_active
+                            and self._recall_preset_for_key_event(key_event)):
+                        return True
                     return super().eventFilter(watched, event)
                 return self._handle_key_press_event(key_event)
         if event.type() == QEvent.KeyRelease:
@@ -2251,8 +2875,6 @@ class PianoAppController(QObject):
         self._on_transpose_changed(self._transpose + delta)
 
     def _handle_key_press_event(self, event: QKeyEvent) -> bool:
-        if self._keyboard_layout_prompt_active:
-            return True
         key = int(event.key())
         if self._tutorial_active:
             if key == int(Qt.Key.Key_Escape) and not event.isAutoRepeat():
@@ -2268,25 +2890,44 @@ class PianoAppController(QObject):
                 and int(event.key()) == int(Qt.Key.Key_Z)
             ):
                 return self._undo_last_keybind_assignment()
+            if key == int(Qt.Key.Key_Delete) and not self._is_keypad_event(event):
+                if self._keybind_selected_note is None:
+                    self._set_keybind_editor_status("Select a piano key first, then press Delete to clear its binding.")
+                else:
+                    self._assign_binding_to_selected_note(None)
+                return True
             binding = self._binding_from_key_event(event)
             if binding is None:
-                if self._keybind_selected_note is None:
-                    self._set_keybind_editor_status("Select a piano key first, then press a combo.")
+                self._set_keybind_editor_status("This key cannot be assigned. Select a piano key and press another combination.")
+                return True
+            reserved = binding_reserved_reason(binding)
+            if reserved:
+                self._set_keybind_editor_status(reserved)
+                return True
+            preset_index = preset_index_for_pc_key(self._sound_presets, binding)
+            if preset_index is not None:
+                # It would never play: the preset takes the key before the note does.
+                self._set_keybind_editor_status(
+                    f"This key recalls the sound preset “{self._sound_presets[preset_index].name}”. "
+                    "Take it away from the preset first: Sound Presets, × next to its PC key.")
+                return True
+            if self._keybind_selected_note is None:
+                self._set_keybind_editor_status("Select a piano key first, then press a combination.")
                 return True
             self._assign_binding_to_selected_note(binding)
             return True
         if key in {int(Qt.Key.Key_Tab), int(Qt.Key.Key_Backtab)}:
             return True
-        if key == int(Qt.Key.Key_Left):
+        if key == int(Qt.Key.Key_Left) and not self._is_keypad_event(event):
             self._step_transpose(-1)
             return True
-        if key == int(Qt.Key.Key_Right):
+        if key == int(Qt.Key.Key_Right) and not self._is_keypad_event(event):
             self._step_transpose(+1)
             return True
-        if key == int(Qt.Key.Key_Up):
+        if key == int(Qt.Key.Key_Up) and not self._is_keypad_event(event):
             self._step_volume(+0.02)
             return True
-        if key == int(Qt.Key.Key_Down):
+        if key == int(Qt.Key.Key_Down) and not self._is_keypad_event(event):
             self._step_volume(-0.02)
             return True
 
@@ -2308,6 +2949,8 @@ class PianoAppController(QObject):
         binding = self._binding_from_key_event(event)
         if binding is None:
             return False
+        if self._recall_preset_for_key_event(event):
+            return True
         if event.isAutoRepeat():
             return True
         keycodes = self._event_keycodes(event)
@@ -2318,8 +2961,6 @@ class PianoAppController(QObject):
         return handled
 
     def _handle_key_release_event(self, event: QKeyEvent) -> bool:
-        if self._keyboard_layout_prompt_active:
-            return True
         key = int(event.key())
         if self._tutorial_active:
             return True
@@ -2332,7 +2973,7 @@ class PianoAppController(QObject):
             int(Qt.Key.Key_Right),
             int(Qt.Key.Key_Up),
             int(Qt.Key.Key_Down),
-        }:
+        } and not self._is_keypad_event(event):
             return True
 
         if key == int(Qt.Key.Key_Space):
@@ -2360,15 +3001,17 @@ class PianoAppController(QObject):
         return handled
 
     @staticmethod
+    def _is_keypad_event(event: QKeyEvent) -> bool:
+        return bool(event.modifiers() & Qt.KeypadModifier) or is_keypad_scan_code(int(event.nativeScanCode()))
+
+    @staticmethod
     def _event_keycodes(event: QKeyEvent) -> tuple[int, ...]:
-        native = int(event.nativeScanCode())
+        native = normalize_scan_code(int(event.nativeScanCode()))
+        if native:
+            return ((1 << 32) | native,)
         key = int(event.key())
-        codes: list[int] = []
-        if native > 0:
-            codes.append(native)
-        if key > 0 and key not in codes:
-            codes.append(key)
-        return tuple(codes)
+        keypad = bool(event.modifiers() & Qt.KeypadModifier)
+        return ((1 << 33) | (int(keypad) << 30) | key,) if key > 0 else ()
 
     @staticmethod
     def _normalize_keycodes(keycodes: int | tuple[int, ...]) -> tuple[int, ...]:
@@ -2382,32 +3025,41 @@ class PianoAppController(QObject):
         return tuple(normalized)
 
     def _binding_from_key_event(self, event: QKeyEvent) -> Binding | None:
-        text = event.text()
-        key_name = self._key_name_from_event(event)
         modifiers = event.modifiers()
-        shift = bool(modifiers & Qt.ShiftModifier)
-        ctrl = bool(modifiers & Qt.ControlModifier)
-        alt = bool(modifiers & Qt.AltModifier)
-        native_scan_code = int(event.nativeScanCode())
-        if self._keyboard_input_mode == "qwerty":
-            mapped = normalize_key_event_qwerty_scancode(
-                native_scan_code,
-                shift=shift,
-                ctrl=ctrl,
-                alt=alt,
+        if modifiers & Qt.MetaModifier:
+            return None
+        native = int(event.nativeScanCode())
+        if native:
+            return normalize_key_event_physical(
+                native,
+                shift=bool(modifiers & Qt.ShiftModifier),
+                ctrl=bool(modifiers & Qt.ControlModifier),
+                alt=bool(modifiers & Qt.AltModifier),
             )
-            if mapped is not None:
-                return mapped
+        key = int(event.key())
+        named_keys = {
+            int(Qt.Key.Key_Space): "space", int(Qt.Key.Key_Tab): "tab",
+            int(Qt.Key.Key_Backtab): "tab", int(Qt.Key.Key_Escape): "escape",
+            int(Qt.Key.Key_Delete): "delete", int(Qt.Key.Key_Backspace): "backspace",
+            int(Qt.Key.Key_Left): "left", int(Qt.Key.Key_Right): "right",
+            int(Qt.Key.Key_Up): "up", int(Qt.Key.Key_Down): "down",
+            int(Qt.Key.Key_Return): "return", int(Qt.Key.Key_Enter): "enter",
+            int(Qt.Key.Key_Insert): "insert", int(Qt.Key.Key_Home): "home",
+            int(Qt.Key.Key_End): "end", int(Qt.Key.Key_PageUp): "pageup",
+            int(Qt.Key.Key_PageDown): "pagedown",
+        }
+        if int(Qt.Key.Key_F1) <= key <= int(Qt.Key.Key_F24):
+            key_name = f"f{key - int(Qt.Key.Key_F1) + 1}"
         else:
-            mapped = normalize_key_event_layout_scancode(
-                native_scan_code,
-                shift=shift,
-                ctrl=ctrl,
-                alt=alt,
-            )
-            if mapped is not None:
-                return mapped
-        return normalize_key_event(text, key_name, shift=shift, ctrl=ctrl, alt=alt)
+            key_name = named_keys.get(key) or self._key_name_from_event(event)
+        return normalize_key_event_physical(
+            int(event.nativeScanCode()),
+            shift=bool(modifiers & Qt.ShiftModifier),
+            ctrl=bool(modifiers & Qt.ControlModifier),
+            alt=bool(modifiers & Qt.AltModifier),
+            key_name=key_name,
+            keypad=bool(modifiers & Qt.KeypadModifier),
+        )
 
     def _handle_keybind_mouse_press_event(self, event: QMouseEvent) -> bool:
         if not self._keybind_edit_active:
@@ -3005,12 +3657,11 @@ class PianoAppController(QObject):
             black_key_pressed_color=self._black_key_pressed_color,
             window_x=self._window_x,
             window_y=self._window_y,
-            keyboard_input_mode=self._keyboard_input_mode,
-            keyboard_layout_choice_seen=self._keyboard_layout_choice_seen,
-            custom_keybinds=serialize_custom_keybind_payload(self._custom_keybind_overrides),
+            custom_keybinds={**self._retained_legacy_keybinds, **serialize_custom_keybind_payload(self._custom_keybind_overrides)},
             split_zones=self._split_zones,
             plugin_folders=self._plugin_folders,
             split_open=self._tutorial_prev_split_open if self._tutorial_active else self._split_open,
+            sound_presets=self._sound_presets,
         )
         try:
             save_settings(settings, self._settings_path)
@@ -3024,76 +3675,14 @@ class PianoAppController(QObject):
                 f"OpenPiano could not save your settings.\n\n{exc}",
             )
 
-    def _maybe_prompt_keyboard_input_mode(self) -> None:
-        if self._is_shutdown or self._keyboard_layout_choice_seen:
+    def _refresh_keyboard_layout(self) -> None:
+        if self._is_shutdown or not refresh_keyboard_labels():
             return
-        app = QApplication.instance()
-        platform_name = str(app.platformName() if app is not None else "").strip().lower()
-        if platform_name in {"offscreen", "minimal", "minimalegl"}:
-            self._apply_keyboard_input_mode("layout", mark_choice_seen=True, persist_now=True)
-            return
-
-        self._prompt_keyboard_input_mode()
-
-    def _on_change_keyboard_layout_requested(self) -> None:
-        if self._tutorial_active or self._keybind_edit_active:
-            return
-        self._prompt_keyboard_input_mode()
-
-    def _prompt_keyboard_input_mode(self) -> None:
-        choice = self._ask_keyboard_input_mode_choice()
-        if choice is None:
-            return
-        self._apply_keyboard_input_mode(choice, mark_choice_seen=True, persist_now=True)
-
-    def _ask_keyboard_input_mode_choice(self) -> str | None:
-        self._keyboard_layout_prompt_active = True
-        self._stop_local_notes()
-        piano_widget = self.window.piano_widget
-        was_enabled = bool(piano_widget.isEnabled())
-        if was_enabled:
-            piano_widget.setEnabled(False)
-        try:
-            return self.window.ask_keyboard_input_mode_choice()
-        finally:
-            if was_enabled:
-                piano_widget.setEnabled(True)
-            self._keyboard_layout_prompt_active = False
-            self._stop_local_notes()
-            piano_widget.setFocus(Qt.ActiveWindowFocusReason)
-            self._refresh_stats_ui()
-
-    def _apply_keyboard_input_mode(self, choice: str | None, *, mark_choice_seen: bool, persist_now: bool) -> None:
-        target = "qwerty" if str(choice or "").strip().lower() == "qwerty" else "layout"
-        previous = self._keyboard_input_mode
-        target_default_keybinds = build_default_keybind_map_full(target)
-        should_translate = previous != target or target == "layout"
-        if should_translate:
-            self._stop_local_notes()
-            translated, overrides = translate_keybind_map(
-                previous_mode=previous,
-                target_mode=target,
-                current_map=self._keybind_committed_map_full,
-                previous_default_map=self._default_keybind_map_full,
-                target_default_map=target_default_keybinds,
-            )
-            self._keybind_committed_map_full = translated
-            self._keybind_staging_map_full = dict(self._keybind_committed_map_full)
-            self._default_keybind_map_full = target_default_keybinds
-            self._custom_keybind_overrides = overrides
-            self._keyboard_input_mode = target
-            self._apply_mode(self._mode, persist=False)
-            self._refresh_stats_ui()
-        else:
-            self._keyboard_input_mode = target
-            self._apply_mode(self._mode, persist=False)
-            self._refresh_stats_ui()
-        if mark_choice_seen:
-            self._keyboard_layout_choice_seen = True
-        if persist_now:
-            self._persist_settings_now()
-        else:
-            self._schedule_persist()
+        self.window.piano_widget.refresh_key_labels()
+        # The computer keys of the sound presets are named after what is printed on them.
+        self._refresh_sound_presets_ui()
+        if self._keybind_edit_active and self._keybind_selected_note is not None:
+            self._on_keybind_note_selected(self._keybind_selected_note)
 
     def _on_window_moved(self) -> None:
         if self._is_shutdown or not self.window.isVisible() or self.window.isFullScreen():
@@ -3189,7 +3778,7 @@ class PianoAppController(QObject):
                 prepared_update_payload(
                     payload,
                     current_version=APP_VERSION,
-                    fallback_url=OFFICIAL_WEBSITE_URL,
+                    fallback_url=UPDATE_PAGE_URL,
                 ),
                 stop_event=self._update_stop_event,
                 progress_callback=_progress,
@@ -3203,7 +3792,7 @@ class PianoAppController(QObject):
                 self._updateInstallHandoffRequested.emit(
                     {
                         "version": str(getattr(prepared_update, "latest_version", "") or payload.get("latest") or ""),
-                        "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                        "url": str(payload.get("url") or UPDATE_PAGE_URL),
                         "requires_elevation": bool(getattr(prepared_update, "requires_elevation", False)),
                     }
                 )
@@ -3220,7 +3809,7 @@ class PianoAppController(QObject):
                     self._update_service.discard_prepared_update(prepared_update)
                 result = {
                     "status": "aborted",
-                    "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                    "url": str(payload.get("url") or UPDATE_PAGE_URL),
                 }
             else:
                 self._update_service.launch_prepared_update(
@@ -3232,7 +3821,7 @@ class PianoAppController(QObject):
                 result = {
                     "status": "ready",
                     "version": str(version or ""),
-                    "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                    "url": str(payload.get("url") or UPDATE_PAGE_URL),
                     "restart_after_update": bool(self._update_handoff_restart),
                 }
         except InterruptedError:
@@ -3243,7 +3832,7 @@ class PianoAppController(QObject):
                     pass
             result = {
                 "status": "canceled",
-                "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                "url": str(payload.get("url") or UPDATE_PAGE_URL),
             }
         except Exception as exc:
             if prepared_update is not None:
@@ -3254,7 +3843,7 @@ class PianoAppController(QObject):
             result = {
                 "status": "error",
                 "error": str(exc),
-                "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                "url": str(payload.get("url") or UPDATE_PAGE_URL),
             }
         if self._is_shutdown:
             return
@@ -3298,7 +3887,7 @@ class PianoAppController(QObject):
         status = str(result.get("status", "error"))
         if status == "available":
             latest = str(result.get("latest", ""))
-            url = str(result.get("url", "") or OFFICIAL_WEBSITE_URL)
+            url = str(result.get("url", "") or UPDATE_PAGE_URL)
             install_supported = bool(
                 result.get("install_supported", False)
                 and result.get("setup_url")
@@ -3324,7 +3913,8 @@ class PianoAppController(QObject):
 
         if status == "up_to_date":
             if manual:
-                show_update_notice(self.window, "You are up to date", "You are using the latest version of OpenPiano.")
+                show_update_notice(self.window, "You are up to date",
+                                   f"This is v{APP_VERSION}. No newer release has been published.")
             return
 
         if manual:
@@ -3362,11 +3952,13 @@ class PianoAppController(QObject):
         message = str(payload.get("error", "Unknown error"))
         choice = show_update_failure(self.window, message, retry=True)
         if choice == "manual":
-            QDesktopServices.openUrl(QUrl(str(payload.get("url") or OFFICIAL_WEBSITE_URL)))
+            QDesktopServices.openUrl(QUrl(str(payload.get("url") or UPDATE_PAGE_URL)))
         elif choice == "retry":
             QTimer.singleShot(0, lambda: self._trigger_update_check(manual=True))
 
     def _update_blocked_reason(self) -> str:
+        if self._audio_request is not None:
+            return "Wait for the instrument to finish loading before installing the update. Choose Cancel to return to OpenPiano."
         if self._recorder.is_recording or self._recording_save_active or self._piano_download_active or self._audio_handoff:
             return "Finish the current recording, export or instrument download before installing the update. Choose Cancel to return to OpenPiano."
         return ""
@@ -3403,9 +3995,11 @@ class PianoAppController(QObject):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._keyboard_layout_monitor.close()
         self._update_stop_event.set()
         self._recording_save_stop_event.set()
         self._piano_download_stop.set()
+        self._cancel_plugin_key_scan()
         self._piano_download_active = False
         self._midi_dropdown_refresh_active = False
         self._recording_save_active = False
@@ -3466,7 +4060,6 @@ class PianoAppController(QObject):
         self._audio_startup_error = ""
 
     def _post_startup_prompts(self) -> None:
-        self._maybe_warn_audio_unavailable()
         if self._is_shutdown:
             return
         if self._plugin_startup_notice:
@@ -3474,4 +4067,4 @@ class PianoAppController(QObject):
             self.window.show_warning("Plug-in Skipped", notice)
             if self._is_shutdown:
                 return
-        self._maybe_prompt_keyboard_input_mode()
+        self._maybe_warn_audio_unavailable()
