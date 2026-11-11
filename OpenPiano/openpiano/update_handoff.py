@@ -11,9 +11,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 if __package__:
-    from .update_product import PRODUCT
+    from .update_product import DOWNLOAD_PAGE_URL, PRODUCT
 else:
-    from update_product import PRODUCT
+    from update_product import DOWNLOAD_PAGE_URL, PRODUCT
 _ARMED: Path | None = None
 _MAINTENANCE_PENDING = False
 _VERSION = re.compile(r"^\d+\.\d+\.\d+$")
@@ -532,7 +532,7 @@ def _run_transaction(record: Path) -> int:
         if committed or acknowledged:
             answer = ctypes.windll.user32.MessageBoxW(None, f"{exc}\n\nOpen the download page?", PRODUCT + " update", 0x14)
             if answer == 6:
-                open_url("https://www.justagwas.com/projects/" + PRODUCT.lower() + "/download")
+                open_url(DOWNLOAD_PAGE_URL)
         return 1
     finally:
         if kernel is not None:

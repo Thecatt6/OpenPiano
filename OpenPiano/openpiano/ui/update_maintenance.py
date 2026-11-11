@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 
 from ..update_cleanup import acknowledge_recovery, maintain_updates, pending_recovery
 from ..update_handoff import PRODUCT, open_url, take_maintenance_request
+from ..update_product import DOWNLOAD_PAGE_URL
 
 
 class UpdateMaintenance(QObject):
@@ -86,7 +87,7 @@ class UpdateMaintenance(QObject):
             except (OSError, RuntimeError, ValueError):
                 pass
             if choice == 'manual':
-                open_url('https://www.justagwas.com/projects/' + PRODUCT.lower() + '/download')
+                open_url(DOWNLOAD_PAGE_URL)
         if self.worker is None and self.notice is None:
             self.timer.stop()
 

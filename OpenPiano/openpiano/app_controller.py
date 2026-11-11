@@ -33,6 +33,7 @@ from openpiano.core.config import (
     TRANSPOSE_MAX,
     TRANSPOSE_MIN,
     UPDATE_CHECK_MANIFEST_URL,
+    UPDATE_PAGE_URL,
     normalize_piano_style,
     normalize_ui_scale,
 )
@@ -347,7 +348,7 @@ class PianoAppController(QObject):
             app_version=APP_VERSION,
             endpoints=UpdateEndpoints(
                 manifest_url=UPDATE_CHECK_MANIFEST_URL,
-                page_url=OFFICIAL_WEBSITE_URL,
+                page_url=UPDATE_PAGE_URL,
             ),
         )
 
@@ -3477,7 +3478,7 @@ class PianoAppController(QObject):
                 prepared_update_payload(
                     payload,
                     current_version=APP_VERSION,
-                    fallback_url=OFFICIAL_WEBSITE_URL,
+                    fallback_url=UPDATE_PAGE_URL,
                 ),
                 stop_event=self._update_stop_event,
                 progress_callback=_progress,
@@ -3491,7 +3492,7 @@ class PianoAppController(QObject):
                 self._updateInstallHandoffRequested.emit(
                     {
                         "version": str(getattr(prepared_update, "latest_version", "") or payload.get("latest") or ""),
-                        "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                        "url": str(payload.get("url") or UPDATE_PAGE_URL),
                         "requires_elevation": bool(getattr(prepared_update, "requires_elevation", False)),
                     }
                 )
@@ -3508,7 +3509,7 @@ class PianoAppController(QObject):
                     self._update_service.discard_prepared_update(prepared_update)
                 result = {
                     "status": "aborted",
-                    "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                    "url": str(payload.get("url") or UPDATE_PAGE_URL),
                 }
             else:
                 self._update_service.launch_prepared_update(
@@ -3520,7 +3521,7 @@ class PianoAppController(QObject):
                 result = {
                     "status": "ready",
                     "version": str(version or ""),
-                    "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                    "url": str(payload.get("url") or UPDATE_PAGE_URL),
                     "restart_after_update": bool(self._update_handoff_restart),
                 }
         except InterruptedError:
@@ -3531,7 +3532,7 @@ class PianoAppController(QObject):
                     pass
             result = {
                 "status": "canceled",
-                "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                "url": str(payload.get("url") or UPDATE_PAGE_URL),
             }
         except Exception as exc:
             if prepared_update is not None:
@@ -3542,7 +3543,7 @@ class PianoAppController(QObject):
             result = {
                 "status": "error",
                 "error": str(exc),
-                "url": str(payload.get("url") or OFFICIAL_WEBSITE_URL),
+                "url": str(payload.get("url") or UPDATE_PAGE_URL),
             }
         if self._is_shutdown:
             return
@@ -3586,7 +3587,7 @@ class PianoAppController(QObject):
         status = str(result.get("status", "error"))
         if status == "available":
             latest = str(result.get("latest", ""))
-            url = str(result.get("url", "") or OFFICIAL_WEBSITE_URL)
+            url = str(result.get("url", "") or UPDATE_PAGE_URL)
             install_supported = bool(
                 result.get("install_supported", False)
                 and result.get("setup_url")
@@ -3612,7 +3613,8 @@ class PianoAppController(QObject):
 
         if status == "up_to_date":
             if manual:
-                show_update_notice(self.window, "You are up to date", "You are using the latest version of OpenPiano.")
+                show_update_notice(self.window, "You are up to date",
+                                   f"This is v{APP_VERSION}. No newer release has been published.")
             return
 
         if manual:
@@ -3650,7 +3652,7 @@ class PianoAppController(QObject):
         message = str(payload.get("error", "Unknown error"))
         choice = show_update_failure(self.window, message, retry=True)
         if choice == "manual":
-            QDesktopServices.openUrl(QUrl(str(payload.get("url") or OFFICIAL_WEBSITE_URL)))
+            QDesktopServices.openUrl(QUrl(str(payload.get("url") or UPDATE_PAGE_URL)))
         elif choice == "retry":
             QTimer.singleShot(0, lambda: self._trigger_update_check(manual=True))
 

@@ -68,7 +68,7 @@ class UpdateDialog(RestoreCursorOnHide, QDialog):
         self.restart_checkbox.setChecked(True)
         self.body_layout.addWidget(self.restart_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
         self.buttons = QHBoxLayout()
-        self.manual_button = QPushButton("Download installer manually", self)
+        self.manual_button = QPushButton("Open download page", self)
         self.manual_button.setObjectName("manualDownloadLink")
         self.manual_button.setFlat(True)
         self.manual_button.setAutoDefault(False)
@@ -205,8 +205,10 @@ QProgressBar::chunk {{ background: {palette['success']}; border-radius: {round(5
         self._configure("available", "Update available", f"Installed: v{APP_VERSION}   |   Available: v{version}")
         self.available_notes.setText(details.strip())
         self.available_notes.setVisible(bool(details.strip()))
-        self.manual_button.show()
-        self.primary_button.setText("Update now")
+        # Without an installer to run, the update is a page to open: one button says so and the
+        # link that would do the same is left out.
+        self.manual_button.setVisible(bool(supported))
+        self.primary_button.setText("Update now" if supported else "Open download page")
         self.cancel_button.setText("Not now")
         self._supported = supported
         self._fit_content()

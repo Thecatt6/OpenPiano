@@ -126,6 +126,12 @@ Both Windows versions include the components and piano sounds needed to start pl
 
 Settings, user SoundFonts, and the plug-in list and plug-in settings normally stay under `%LOCALAPPDATA%\OpenPiano`, including with standalone. Moving the executable does not move those files. Save recordings to the location you choose. Playing and recording work locally; updates, optional downloads, and links you open can use the internet.
 
+### Updates of this build
+
+This repository is a fork of [OpenPiano](https://github.com/Justagwas/OpenPiano) that adds the keyboard split, VST3 plug-ins and sound presets. It looks for new versions only among [its own releases](https://github.com/Thecatt6/OpenPiano/releases): at start-up while **Settings > Updates > Automatic updates** is on, and whenever you choose **Check for updates now**.
+
+When a newer release is there, OpenPiano shows its version and notes, and **Open download page** takes you to it; download the new `OpenPiano.exe` and put it in place of the old one. Nothing is downloaded or installed by the program itself, and your settings stay where they are. The releases of the original OpenPiano are not followed, because its installer would replace this build with one that has none of the additions above.
+
 ## Project resources
 
 - Project page: <https://www.justagwas.com/projects/openpiano/>
@@ -160,6 +166,18 @@ py build_exe.py
 ```
 
 [`build_exe.py`](OpenPiano/build_exe.py) runs PyInstaller and writes `dist\OpenPiano.exe`, a single file that runs without Python installed. It packs the FluidSynth libraries, the VST3 host and the SoundFonts found in `OpenPiano\soundfonts`; add `--soundfonts FOLDER` to pack the SoundFonts of another folder as well. `--folder` makes a folder that starts faster instead of one file, and `--console` keeps a console open to read error messages. VST3 plug-ins are not packed; they stay where they are installed.
+
+### Publishing an Update
+
+The version is `APP_VERSION` in [`config.py`](OpenPiano/openpiano/core/config.py). Its first three numbers are the release of the original OpenPiano the code is based on and the fourth is the revision of this fork: `2.0.2.1`, then `2.0.2.2`, and `2.0.3.1` once the original's 2.0.3 has been merged.
+
+1. Raise `APP_VERSION`.
+2. Build the program with `py build_exe.py`; the last lines it prints name the version and the tag to use.
+3. On GitHub, create a release of this repository whose tag is `v` followed by that version, for example `v2.0.2.2`, and attach `dist\OpenPiano.exe`. Up to eight lines of the description that start with `-` are shown in the program as the release notes.
+
+Copies with a lower version then offer the release. The check reads `https://api.github.com/repos/Thecatt6/OpenPiano/releases/latest`, so drafts and pre-releases are not offered, and a release whose tag is not a version number is reported as an error by **Check for updates now**. Build the program again after raising the version: a copy that reports an older version than the newest release keeps offering it.
+
+The repository that is checked is `RELEASES_REPOSITORY` in [`update_product.py`](OpenPiano/openpiano/update_product.py). The original's installer hand-off is still in the code but is never reached, because a release here carries no installer for it.
 
 ### Configuration Files
 
